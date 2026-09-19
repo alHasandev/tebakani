@@ -1,0 +1,23 @@
+{
+  "name": "@tebakani/backend",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun --watch run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "check": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "0.2.16",
+    "@elysiajs/cors": "^1.2.0",
+    "@tebakani/shared": "workspace:*",
+    "ai": "4.3.19",
+    "elysia": "^1.2.10",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "tebakani",
+  "private": true,
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "bun run --parallel --workspaces --if-present dev",
+    "dev:backend": "bun --watch run --cwd packages/backend src/index.ts",
+    "dev:frontend": "bun --cwd packages/frontend dev",
+    "build:backend": "bun --cwd packages/backend build",
+    "build:frontend": "bun --cwd packages/frontend build",
+    "test:backend": "bun test --cwd packages/backend",
+    "check": "bun --cwd packages/backend check && bun --cwd packages/frontend check"
+  }
+}

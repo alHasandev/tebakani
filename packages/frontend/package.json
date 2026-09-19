@@ -1,0 +1,28 @@
+{
+  "name": "@tebakani/frontend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "check": "svelte-check --tsconfig ./tsconfig.json"
+  },
+  "dependencies": {
+    "@tebakani/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@iconify/json": "^2.2.530",
+    "@iconify/tailwind4": "^1.2.3",
+    "@sveltejs/vite-plugin-svelte": "^5.0.3",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tsconfig/svelte": "^5.0.4",
+    "daisyui": "^5.7.42",
+    "svelte": "^5.20.2",
+    "svelte-check": "^4.1.4",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0"
+  }
+}
