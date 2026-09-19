@@ -135,7 +135,8 @@ export class GameService {
       this.economy.getLedger(game.id, viewerPlayerId),
       this.economy.getHints(game.id, viewerPlayerId),
       this.activity?.get(game.id, turnDetails?.turn.id ?? null).activity ?? [],
-      this.activity?.get(game.id, turnDetails?.turn.id ?? null).lastAction ?? null
+      this.activity?.get(game.id, turnDetails?.turn.id ?? null).lastAction ?? null,
+      this.turnRepo.listHistory(game.id)
     );
   }
 
@@ -253,7 +254,7 @@ export class GameService {
     if (!activeTurn || activeTurn.turn.id !== expectedTurnId || activeTurn.turn.activePlayerId !== requesterPlayerId) {
       throw new DomainError(403, "Only the active player can close answers");
     }
-    this.economy.settleTurn(game.id, expectedTurnId);
+    this.economy.settleTurn(game.id, expectedTurnId, { requesterPlayerId });
     return this.gameRepo.getGameByRoomId(room.id)!;
   }
 
@@ -305,14 +306,23 @@ export class GameService {
     return this.hints.purchase(game.id, requesterPlayerId, expectedTurnId, hintType, state.character);
   }
 
-  async closeAnswersAsAI(code: string, actor: GameActor & { kind: "ai" }, expectedTurnId: string, collectionDelayMs: number, nowMs: number): Promise<GameEntity> {
+  async reconcileAnswerClosure(code: string, expectedTurnId: string, nowMs: number): Promise<GameEntity> {
+    const room = this.roomRepo.getRoomByCode(code);
+    if (!room) throw new DomainError(404, "Room not found");
+    const game = this.gameRepo.getGameByRoomId(room.id);
+    if (!game) throw new DomainError(404, "Game not found");
+    this.economy.settleTurn(game.id, expectedTurnId, { nowMs });
+    return this.gameRepo.getGameByRoomId(room.id)!;
+  }
+
+  async closeAnswersAsAI(code: string, actor: GameActor & { kind: "ai" }, expectedTurnId: string, _collectionDelayMs: number, nowMs: number): Promise<GameEntity> {
     const room = this.roomRepo.getRoomByCode(code);
     if (!room) throw new DomainError(404, "Room not found");
     const game = this.gameRepo.getGameByRoomId(room.id);
     if (!game) throw new DomainError(404, "Game not found");
     const state = this.gameRepo.getPlayerGameStates(game.id).find((entry) => entry.playerId === actor.playerId);
     if (!state || state.playerType !== "ai") throw new DomainError(403, "Trusted AI actor is not an AI player in this game");
-    this.economy.settleTurn(game.id, expectedTurnId, { playerId: actor.playerId, collectionDelayMs, nowMs });
+    this.economy.settleTurn(game.id, expectedTurnId, { requesterPlayerId: actor.playerId, nowMs });
     return this.gameRepo.getGameByRoomId(room.id)!;
   }
 

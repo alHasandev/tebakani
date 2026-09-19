@@ -28,30 +28,41 @@ export class AIPlayerRunner {
     if (!state || !game || game.status !== "playing") return;
     if (state.turn.phase === "collecting_answers" && state.question) {
       for (const playerId of this.turnRepo.listMissingAIAnswerers(gameId, state.turn.id)) this.run(`answer:${state.question.id}:${playerId}`, (signal) => this.answer(game.roomCode, gameId, state.turn.id, playerId, signal));
-      if (state.turn.activePlayerType === "ai") {
-        const collection = this.turnRepo.getCollectionState(gameId, state.turn.id);
-        const key = `close:${state.question.id}`;
-        if (collection && collection.answeredCount >= collection.eligibleCount) this.cancel(key);
-        if (!collection || collection.moderatorStatus !== "failed" || collection.moderatorAttempts < this.config.moderatorRetries + 1) this.run(key, (signal) => this.close(game.roomCode, gameId, state.turn.id, signal), () => {
-          const latest = this.turnRepo.getCollectionState(gameId, state.turn.id);
-          if (latest?.moderatorStatus !== "pending") this.reconcile(gameId);
-        });
-      }
+      const collection = this.turnRepo.getCollectionState(gameId, state.turn.id);
+      const key = `close:${state.question.id}`;
+      const mayRetryModerator = state.turn.activePlayerType === "ai" && collection?.moderatorStatus === "failed" && collection.moderatorAttempts < this.config.moderatorRetries + 1;
+      if (collection && collection.answeredCount >= collection.eligibleCount) this.cancel(key);
+      if (collection?.moderatorStatus !== "failed" || mayRetryModerator) this.run(key, (signal) => this.close(game.roomCode, gameId, state.turn.id, state.turn.activePlayerType === "ai", signal), () => {
+        const latest = this.turnRepo.getCollectionState(gameId, state.turn.id);
+        const retryableFailure = latest?.moderatorStatus === "failed" && state.turn.activePlayerType === "ai" && latest.moderatorAttempts < this.config.moderatorRetries + 1;
+        if (latest?.moderatorStatus === "answered" || retryableFailure) this.reconcile(gameId);
+      });
     }
     if (state.turn.activePlayerType !== "ai") return;
     if (state.turn.phase === "waiting_for_question") this.run(`turn:${state.turn.id}:question`, (signal) => this.ask(game.roomCode, gameId, state.turn.id, state.turn.activePlayerId, signal));
     if (state.turn.phase === "awaiting_guess") this.run(`turn:${state.turn.id}:guess`, (signal) => this.guess(game.roomCode, gameId, state.turn.id, state.turn.activePlayerId, signal));
   }
 
-  async drain(): Promise<void> { while (this.tasks.size) await Promise.allSettled([...this.tasks.values()]); }
-  async stop(): Promise<void> { this.stopped = true; for (const controller of this.controllers.values()) controller.abort(); await this.drain(); }
+  async drain(includeCloseTasks = false): Promise<void> {
+    while (true) {
+      const active = [...this.tasks.entries()].filter(([key]) => includeCloseTasks || !key.startsWith("close:")).map(([, task]) => task);
+      if (!active.length) return;
+      await Promise.allSettled(active);
+    }
+  }
+  async stop(): Promise<void> { this.stopped = true; for (const controller of this.controllers.values()) controller.abort(); await this.drain(true); }
 
   private cancel(key: string): void { this.controllers.get(key)?.abort(); }
   private run(key: string, work: (signal: AbortSignal) => Promise<void>, after?: () => void): void {
     if (this.tasks.has(key) || this.stopped) return;
     const controller = new AbortController();
     this.controllers.set(key, controller);
-    const task = work(controller.signal).catch(() => {}).finally(() => { if (this.controllers.get(key) === controller) this.controllers.delete(key); this.tasks.delete(key); if (!this.stopped) after?.(); });
+    let task: Promise<void>;
+    task = work(controller.signal).catch(() => {}).finally(() => {
+      if (this.controllers.get(key) === controller) this.controllers.delete(key);
+      if (this.tasks.get(key) === task) this.tasks.delete(key);
+      if (!this.stopped) after?.();
+    });
     this.tasks.set(key, task);
   }
 
@@ -90,13 +101,26 @@ export class AIPlayerRunner {
       if (signal.aborted || this.stopped) return;
       context = this.contexts.buildSelf(gameId, playerId, turnId);
       this.activity.set(gameId, playerId, turnId, "asking"); this.hooks.stateChanged?.(code);
-      let question = "Is this character primarily known for fighting?";
-      try { question = await this.agent.generateQuestion(context, signal); } catch {
-        const used = new Set(context.evidence.map((entry) => entry.question.toLocaleLowerCase()));
-        question = ["Is this character human?", "Does this character have supernatural abilities?", "Is this character an adult?"].find((item) => !used.has(item.toLocaleLowerCase())) ?? `Is this character from a series with action elements (${context.game.turnNumber})?`;
+      const normalize = (value: string) => value.normalize("NFKC").toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, " ").trim();
+      const used = new Set(this.contexts.getUsedQuestionIdentities(gameId, playerId));
+      const fallback = () => {
+        const candidates = ["Is this character human?", "Does this character have supernatural abilities?", "Is this character an adult?", "Is this character primarily known for fighting?"];
+        return candidates.find((item) => !used.has(normalize(item))) ?? `Does this character match clue ${turnId}?`;
+      };
+      let question: string;
+      try { question = await this.agent.generateQuestion(context, signal); } catch { question = fallback(); }
+      if (used.has(normalize(question)) && !signal.aborted && !this.stopped) {
+        try { question = await this.agent.generateQuestion(context, signal); } catch { question = fallback(); }
       }
+      if (used.has(normalize(question))) question = fallback();
       if (signal.aborted || this.stopped) return;
-      await this.gameService.askQuestionAsAI(code, { kind: "ai", playerId }, turnId, question);
+      try {
+        await this.gameService.askQuestionAsAI(code, { kind: "ai", playerId }, turnId, question);
+      } catch (error: any) {
+        if (error?.status !== 409 || !String(error?.message).includes("already been asked")) throw error;
+        used.add(normalize(question));
+        await this.gameService.askQuestionAsAI(code, { kind: "ai", playerId }, turnId, fallback());
+      }
       this.activity.record(gameId, playerId, turnId, "question_asked", "completed");
       const questionId = this.gameService.getQuestionId(code, turnId);
       this.changed(code, gameId);
@@ -104,28 +128,27 @@ export class AIPlayerRunner {
     } catch {} finally { this.activity.clear(gameId, playerId, turnId); this.hooks.stateChanged?.(code); }
   }
 
-  private async close(code: string, gameId: string, turnId: string, signal: AbortSignal): Promise<void> {
+  private async close(code: string, gameId: string, turnId: string, activePlayerIsAI: boolean, signal: AbortSignal): Promise<void> {
     const state = this.turnRepo.getCollectionState(gameId, turnId);
     if (!state) return;
     if (state.moderatorStatus === "failed") {
-      if (state.moderatorAttempts >= this.config.moderatorRetries + 1) return;
+      if (!activePlayerIsAI || state.moderatorAttempts >= this.config.moderatorRetries + 1) return;
       try { await this.gameService.retryModerator(code, state.activePlayerId, turnId); this.hooks.stateChanged?.(code); } catch {}
       if (!signal.aborted && !this.stopped) this.reconcile(gameId);
       return;
     }
     if (state.moderatorStatus !== "answered") return;
-    const elapsed = Math.max(0, this.runtime.now() - Date.parse(state.askedAt));
-    if (state.answeredCount < state.eligibleCount && elapsed < this.config.collectionDelayMs && !await this.wait(this.config.collectionDelayMs - elapsed, signal)) return;
+    const remaining = Math.max(0, Date.parse(state.answerDeadlineAt) - this.runtime.now());
+    if (state.answeredCount < state.eligibleCount && remaining > 0 && !await this.wait(remaining, signal)) return;
     if (signal.aborted || this.stopped) return;
-    try { await this.gameService.closeAnswersAsAI(code, { kind: "ai", playerId: state.activePlayerId }, turnId, this.config.collectionDelayMs, this.runtime.now()); this.changed(code, gameId); } catch {}
+    try { await this.gameService.reconcileAnswerClosure(code, turnId, this.runtime.now()); this.changed(code, gameId); } catch {}
   }
 
   private async guess(code: string, gameId: string, turnId: string, playerId: string, signal: AbortSignal): Promise<void> {
     this.activity.set(gameId, playerId, turnId, "guessing"); this.hooks.stateChanged?.(code);
     try {
       if (!await this.delay(this.config.thinkDelayMinMs, this.config.thinkDelayMaxMs, signal)) return;
-      let decision: Awaited<ReturnType<AIPlayerAgent["decideGuessOrPass"]>> = { action: "pass" };
-      try { decision = await this.agent.decideGuessOrPass(this.contexts.buildSelf(gameId, playerId, turnId), signal); } catch {}
+      const decision = await this.agent.decideGuessOrPass(this.contexts.buildSelf(gameId, playerId, turnId), signal);
       if (signal.aborted || this.stopped) return;
       if (decision.action === "guess") {
         const normalized = decision.characterName.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");

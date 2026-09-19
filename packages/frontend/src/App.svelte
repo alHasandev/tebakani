@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { ECONOMY, type Player, type Room, type LobbyState, type GameView, type AnswerValue, type HintType, type PurchaseHintResponse, type AIActivityStatus } from "@tebakani/shared";
+  import { createTimerClockReference, historyOutcomeText, secondsUntilDeadline, timerAnnouncementFor, timerAnnouncementText, type TimerClockReference } from "./timer";
 
   const STORAGE_KEY = "tebakani_session";
 
@@ -16,6 +17,11 @@
   let joinCode = $state("");
   let joinName = $state("");
   let aiPlayerName = $state("");
+  let answerDurationSeconds = $state(60);
+  let clockTick = $state(0);
+  let timerClockReference = $state<TimerClockReference | null>(null);
+  let timerAnnouncement = $state("");
+  let timerAnnouncementKey = $state("");
 
   // Turn action form states
   let questionInput = $state("");
@@ -58,6 +64,7 @@
 
   function mergeGameState(incoming: GameView) {
     if (!activeGame || activeGame.id !== incoming.id || activeGame.roomId !== incoming.roomId || incoming.revision >= activeGame.revision) {
+      timerClockReference = createTimerClockReference(incoming.serverTime);
       activeGame = incoming;
     }
   }
@@ -177,6 +184,19 @@
     } catch (err) {
       console.error("Failed to fetch game state over REST", err);
     }
+  }
+
+  async function handleTimerChange() {
+    if (!currentRoom || !sessionToken || !currentPlayer?.isHost) return;
+    resetFormErrors();
+    const res = await fetch(`/api/rooms/${currentRoom.code}/settings/answer-timer`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${sessionToken}` },
+      body: JSON.stringify({ answerDurationSeconds })
+    });
+    const result = await parseActionResponse<LobbyState>(res);
+    if (!result.ok) errorMsg = result.error;
+    else currentRoom = result.data.room;
   }
 
   async function handleStartGame() {
@@ -499,7 +519,8 @@
         if (msg.type === "lobby_update") {
           const lobby = msg.data as LobbyState;
           players = lobby.players;
-          currentRoom = lobby.room;
+           currentRoom = lobby.room;
+           answerDurationSeconds = lobby.room.answerDurationSeconds;
         } else if (msg.type === "game_started" || msg.type === "game_state" || msg.type === "game_finished") {
           mergeGameState(msg.data as GameView);
         } else if (msg.type === "error") {
@@ -641,10 +662,32 @@
   });
 
   let aiLiveStatus = $derived(currentAIActivity?.text ?? lastAIActionText);
+  function currentSecondsRemaining(deadline: string, reference: TimerClockReference, tick: number): number {
+    void tick;
+    return secondsUntilDeadline(deadline, reference);
+  }
+  let secondsRemaining = $derived(activeGame?.currentTurn?.question?.answerDeadlineAt && timerClockReference ? currentSecondsRemaining(activeGame.currentTurn.question.answerDeadlineAt, timerClockReference, clockTick) : null);
+  let answerWindowReady = $derived(Boolean(activeGame?.currentTurn?.question && (activeGame.currentTurn.question.answeredCount >= activeGame.currentTurn.question.eligibleAnswererCount || secondsRemaining === 0)));
+
+  $effect(() => {
+    const questionId = activeGame?.currentTurn?.phase === "collecting_answers" ? activeGame.currentTurn.question?.id : null;
+    if (!questionId) {
+      timerAnnouncement = "";
+      timerAnnouncementKey = "";
+    } else if (secondsRemaining !== null) {
+      const announcement = timerAnnouncementFor(null, secondsRemaining, timerAnnouncementKey === `${questionId}:ten`, timerAnnouncementKey === `${questionId}:timeout`);
+      if (announcement) {
+        timerAnnouncement = timerAnnouncementText(announcement);
+        timerAnnouncementKey = `${questionId}:${announcement}`;
+      }
+    }
+  });
 
   onMount(() => {
     restoreSession();
+    const clockInterval = window.setInterval(() => { clockTick++; }, 250);
     return () => {
+      window.clearInterval(clockInterval);
       restoreGeneration++;
       if (socket) {
         socket.close();
@@ -656,6 +699,7 @@
 
 <main id="main-content" tabindex="-1" class="mx-auto my-4 w-[calc(100%-2rem)] max-w-6xl overflow-hidden rounded-box border border-base-300 bg-base-100 shadow-2xl sm:my-8">
   <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{aiLiveStatus}</div>
+  <div class="sr-only" role="status" aria-live="polite" aria-atomic="true">{timerAnnouncement}</div>
   <header class="bg-neutral px-5 py-8 text-center text-neutral-content sm:px-8">
     <h1 class="flex items-center justify-center gap-2 bg-gradient-to-r from-neutral-content via-accent to-neutral-content bg-clip-text text-4xl font-black tracking-tight text-transparent sm:text-5xl"><span class="icon-[material-symbols--stadia-controller-rounded] text-neutral-content" aria-hidden="true"></span>TebakAni</h1>
     <p class="mt-2 text-sm font-medium text-neutral-content sm:text-base">Realtime Anime Guessing Game</p>
@@ -963,7 +1007,12 @@
               {:else if currentTurn.phase === "collecting_answers" && currentTurn.question}
                 {@const q = currentTurn.question}
                 <div class="rounded-box border border-base-300 bg-base-100 p-4 shadow-sm">
-                  <span class="text-xs font-bold uppercase tracking-wider text-base-content/80">Question:</span>
+                  <div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+                    <span class="text-xs font-bold uppercase tracking-wider text-base-content/80">Question:</span>
+                    <span class={secondsRemaining === 0 ? "badge badge-error font-bold" : secondsRemaining !== null && secondsRemaining <= 10 ? "badge badge-warning font-bold" : "badge badge-neutral font-bold"} aria-hidden="true">{secondsRemaining ?? 0}s</span>
+                  </div>
+                  <p class="text-sm text-base-content/80">{q.answeredCount} of {q.eligibleAnswererCount} eligible players answered. {secondsRemaining === 0 && q.moderatorStatus !== "answered" ? "Time expired; waiting for Moderator." : "Answers close automatically when everyone answers or time expires."}</p>
+                  <span class="sr-only">Answer collection status: {secondsRemaining ?? 0} seconds remaining.</span>
                   <p class="mt-1 text-lg font-bold text-base-content">"{q.questionText}"</p>
                 </div>
 
@@ -973,7 +1022,7 @@
                     <span>{isRetryingModerator ? "Retrying…" : "AI moderator is thinking…"}</span>
                   {:else if q.moderatorStatus === "answered"}
                     <span class="icon-[material-symbols--check-circle-rounded] text-base-content" aria-hidden="true"></span>
-                    AI moderator: <strong>{q.moderatorAnswer?.toUpperCase()}</strong>
+                    <span>AI Moderator siap — jawaban disegel sampai pengumpulan selesai</span>
                   {:else}
                     <span class="icon-[material-symbols--error-rounded] text-base-content" aria-hidden="true"></span>
                     AI moderator failed to answer.
@@ -996,7 +1045,7 @@
                             name="player-answer"
                             value={option}
                             checked={myAnswer === option}
-                            disabled={isSubmittingAction}
+                            disabled={isSubmittingAction || secondsRemaining === 0}
                             onchange={() => handleAnswer(option as AnswerValue)}
                             class="sr-only"
                           />
@@ -1026,11 +1075,11 @@
                     <button
                       type="button"
                       class="btn btn-secondary min-h-11 w-full focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-secondary"
-                      disabled={isSubmittingAction || q.moderatorStatus !== "answered"}
-                      onclick={handleCloseAnswers}
-                    >
-                      <span class="icon-[material-symbols--arrow-forward-rounded]" aria-hidden="true"></span>
-                      Close Answers & Proceed to Guess
+                       disabled={isSubmittingAction || q.moderatorStatus !== "answered" || !answerWindowReady}
+                       onclick={handleCloseAnswers}
+                     >
+                       <span class="icon-[material-symbols--arrow-forward-rounded]" aria-hidden="true"></span>
+                       {q.moderatorStatus !== "answered" ? "Waiting for Moderator" : !answerWindowReady ? "Waiting for answers or deadline" : "Proceed to Guess"}
                     </button>
                     <button type="button" class="btn btn-outline min-h-11 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary" disabled={isSubmittingAction} onclick={handlePass}>
                       <span class="icon-[material-symbols--redo-rounded]" aria-hidden="true"></span>
@@ -1102,7 +1151,54 @@
             </div>
           {/if}
 
-          <h3 class="text-xl font-black">Player Roster & Status</h3>
+           <details class="rounded-box border border-base-300 bg-base-100 p-4 shadow-sm">
+             <summary class="cursor-pointer font-black">Game History ({activeGame.history.length})</summary>
+             {#if activeGame.history.length}
+               <ol class="mt-4 space-y-4">
+                 {#each activeGame.history as item (item.turnId)}
+                   <li class="rounded-box bg-base-200 p-3">
+                      <p class="font-bold">Turn {item.turnNumber}: {item.activePlayerName} ({item.activePlayerType})</p>
+                      {#if item.hintPurchases.length}
+                        <ul class="mt-2 space-y-1" aria-label={`Hint purchases during turn ${item.turnNumber}`}>
+                          {#each item.hintPurchases as purchase (purchase.id)}
+                            <li class="text-sm">
+                              Hint purchased: {purchase.playerName} bought {purchase.hintType} (-{purchase.cost} point{purchase.cost === 1 ? "" : "s"})
+                              <time class="text-base-content/60" datetime={purchase.purchasedAt}> · {new Date(purchase.purchasedAt).toLocaleTimeString()}</time>
+                            </li>
+                          {/each}
+                        </ul>
+                      {/if}
+                      {#if item.question}
+
+                       <p class="mt-2">Question: {item.question.questionText}</p>
+                       <p>Moderator: {item.question.moderatorStatus === "answered" ? item.question.moderatorAnswer?.toUpperCase() : item.question.moderatorStatus}</p>
+                       {#if item.question.answers.length}
+                         <ul class="mt-2 space-y-1">
+                           {#each item.question.answers as answer (answer.playerId)}
+                             {@const award = item.question.awards.find(entry => entry.playerId === answer.playerId)}
+                             <li>{answer.playerName}: {answer.answer.toUpperCase()}{award ? ` (+${award.amount})` : ""}</li>
+                           {/each}
+                         </ul>
+                       {/if}
+                     {/if}
+                     {#if item.guess}
+                       <p class="mt-2">Guess: {item.guess.characterName} — {item.guess.correct ? "correct" : "incorrect"}</p>
+                     {:else if item.outcome === "passed"}
+                       <p class="mt-2">Outcome: passed</p>
+                      {:else if item.outcome === "skipped"}
+                        <p class="mt-2">Outcome: skipped</p>
+                      {:else if item.outcome === "unknown"}
+                        <p class="mt-2">{historyOutcomeText(item.outcome)}</p>
+                      {/if}
+                   </li>
+                 {/each}
+               </ol>
+             {:else}
+               <p class="mt-3 text-sm text-base-content/80">No turns yet.</p>
+             {/if}
+           </details>
+
+           <h3 class="text-xl font-black">Player Roster & Status</h3>
           <ul class="grid gap-3 md:grid-cols-2" role="list">
             {#each activeGame.players as player (player.playerId)}
               <li class={player.isCurrentTurn ? "card border-2 border-primary bg-primary/10 shadow-lg" : "card border border-base-300 bg-base-100 shadow-md"}>
@@ -1209,6 +1305,19 @@
               </li>
             {/each}
           </ul>
+
+          <div class="card border border-base-300 bg-base-100 p-4 shadow-sm">
+            <label for="answer-duration" class="font-bold">Answer timer</label>
+            <p id="answer-duration-help" class="text-sm text-base-content/80">15–300 seconds. Locked when the game starts. Default 60 seconds.</p>
+            <div class="mt-2 flex items-center gap-3">
+              <input id="answer-duration" type="number" min="15" max="300" step="1" bind:value={answerDurationSeconds} disabled={!currentPlayer?.isHost} aria-describedby="answer-duration-help" class="input input-bordered min-h-11 w-32" />
+              {#if currentPlayer?.isHost}
+                <button type="button" class="btn btn-outline min-h-11" onclick={handleTimerChange}>Save timer</button>
+              {:else}
+                <span class="font-semibold">{currentRoom.answerDurationSeconds} seconds</span>
+              {/if}
+            </div>
+          </div>
 
           {#if currentPlayer?.isHost}
             <div class="card gap-4 border border-secondary/40 bg-secondary/10 p-4 shadow-lg">

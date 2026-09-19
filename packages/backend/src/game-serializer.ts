@@ -10,7 +10,8 @@ export function serializeGameForViewer(
   ownLedger: PointLedgerEntry[] = [],
   ownHints: PurchasedHint[] = [],
   aiActivity: AIActivityView[] = [],
-  lastAIAction: AIActionView | null = null
+  lastAIAction: AIActionView | null = null,
+  historyDetails: FullTurnDetails[] = []
 ): GameView {
   const players: GamePlayerStateView[] = playerStates.map((ps) => {
     const isSelf = ps.playerId === viewerPlayerId;
@@ -60,8 +61,11 @@ export function serializeGameForViewer(
             questionText: turnDetails.question.questionText,
             askedAt: turnDetails.question.askedAt,
             moderatorStatus: turnDetails.question.moderatorStatus,
-            moderatorAnswer: turnDetails.question.moderatorAnswer,
+            moderatorAnswer: turnDetails.turn.phase === "collecting_answers" ? null : turnDetails.question.moderatorAnswer,
             moderatorRevision: turnDetails.question.moderatorRevision,
+            answerDeadlineAt: turnDetails.question.answerDeadlineAt,
+            eligibleAnswererCount: turnDetails.question.eligibleAnswererCount,
+            answeredCount: turnDetails.question.answeredCount,
             answers: turnDetails.answers.map((a) => ({
               playerId: a.answeringPlayerId,
               playerName: a.answeringPlayerName,
@@ -81,8 +85,35 @@ export function serializeGameForViewer(
     roomCode: game.roomCode,
     status: game.status,
     revision: game.revision,
+    serverTime: new Date().toISOString(),
     currentTurnPlayerId: game.currentTurnPlayerId,
     currentTurn,
+    answerDurationSeconds: game.answerDurationSeconds,
+    history: historyDetails.map((details) => ({
+      turnId: details.turn.id,
+      turnNumber: details.turn.turnNumber,
+      activePlayerId: details.turn.activePlayerId,
+      activePlayerName: details.turn.activePlayerName,
+      activePlayerType: details.turn.activePlayerType,
+      question: details.question ? {
+        id: details.question.id,
+        questionText: details.question.questionText,
+        askedAt: details.question.askedAt,
+        answerDeadlineAt: details.question.answerDeadlineAt,
+        moderatorStatus: details.question.moderatorStatus,
+        moderatorAnswer: details.question.moderatorAnswer,
+        moderatorRevision: details.question.moderatorRevision,
+        eligibleAnswererCount: details.question.eligibleAnswererCount,
+        answeredCount: details.question.answeredCount,
+        answers: details.answers.map((answer) => ({ playerId: answer.answeringPlayerId, playerName: answer.answeringPlayerName, answer: answer.answer, answeredAt: answer.answeredAt })),
+        awards: details.awards
+      } : null,
+      outcome: details.turn.outcome ?? (details.turn.endedAt ? "unknown" : null),
+      guess: details.guess,
+      hintPurchases: details.hintPurchases,
+      startedAt: details.turn.startedAt,
+      endedAt: details.turn.endedAt
+    })),
     players,
     ownLedger,
     ownHints,

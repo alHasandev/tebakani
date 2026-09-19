@@ -4,7 +4,11 @@ import type { Player, Room } from "@tebakani/shared";
 import { generateRoomCode, generateSessionToken } from "./utils";
 import { DomainError } from "./errors";
 
-interface RoomRow { id: string; code: string; created_at: string }
+interface RoomRow { id: string; code: string; answer_duration_seconds: number; created_at: string }
+
+function mapRoom(row: RoomRow): Room {
+  return { id: row.id, code: row.code, answerDurationSeconds: row.answer_duration_seconds, createdAt: row.created_at };
+}
 interface PlayerRow { id: string; room_id: string; name: string; type: string; is_host: number; session_token: string | null; connected: number; created_at: string }
 
 function mapPlayer(row: PlayerRow): Player {
@@ -32,12 +36,23 @@ export class RoomRepository {
     const playerId = randomUUID();
     const sessionToken = generateSessionToken();
     this.db.prepare("INSERT INTO players (id, room_id, name, type, is_host, session_token, connected, created_at) VALUES (?, ?, ?, 'human', 1, ?, 0, ?)").run(playerId, roomId, creatorName, sessionToken, now);
-    return { room: { id: roomId, code, createdAt: now }, player: { id: playerId, roomId, name: creatorName, type: "human", isHost: true, connected: false, createdAt: now }, sessionToken };
+    return { room: { id: roomId, code, answerDurationSeconds: 60, createdAt: now }, player: { id: playerId, roomId, name: creatorName, type: "human", isHost: true, connected: false, createdAt: now }, sessionToken };
   }
 
   getRoomByCode(code: string): Room | null {
-    const row = this.db.prepare("SELECT id, code, created_at FROM rooms WHERE code = ?").get(code.toUpperCase()) as RoomRow | null;
-    return row ? { id: row.id, code: row.code, createdAt: row.created_at } : null;
+    const row = this.db.prepare("SELECT id, code, answer_duration_seconds, created_at FROM rooms WHERE code = ?").get(code.toUpperCase()) as RoomRow | null;
+    return row ? mapRoom(row) : null;
+  }
+
+  updateAnswerDuration(roomId: string, requesterPlayerId: string, seconds: number): Room {
+    if (!Number.isInteger(seconds) || seconds < 15 || seconds > 300) throw new DomainError(400, "Answer duration must be an integer between 15 and 300 seconds");
+    this.db.transaction(() => {
+      const requester = this.db.prepare("SELECT is_host, type FROM players WHERE id = ? AND room_id = ?").get(requesterPlayerId, roomId) as { is_host: number; type: string } | null;
+      if (!requester || !requester.is_host || requester.type !== "human") throw new DomainError(403, "Only the human host can update the answer timer");
+      if (this.db.prepare("SELECT id FROM games WHERE room_id = ?").get(roomId)) throw new DomainError(409, "Answer timer can only be changed before the game starts");
+      this.db.prepare("UPDATE rooms SET answer_duration_seconds = ? WHERE id = ?").run(seconds, roomId);
+    })();
+    return this.getRoomByCode((this.db.prepare("SELECT code FROM rooms WHERE id = ?").get(roomId) as { code: string }).code)!;
   }
 
   joinRoom(code: string, playerName: string, playerType: "human" | "ai" = "human"): { status: "success"; room: Room; player: Player; sessionToken: string } | { status: "not_found" } | { status: "game_already_started" } {
@@ -72,7 +87,8 @@ export class RoomRepository {
   authenticatePlayer(token: string): { player: Player; room: Room } | null {
     const row = this.db.prepare(`SELECT p.*, r.code room_code, r.created_at room_created_at FROM players p JOIN rooms r ON p.room_id = r.id WHERE p.session_token = ? AND p.type = 'human'`).get(token) as (PlayerRow & { room_code: string; room_created_at: string }) | null;
     if (!row) return null;
-    return { player: mapPlayer(row), room: { id: row.room_id, code: row.room_code, createdAt: row.room_created_at } };
+    const room = this.getRoomByCode(row.room_code);
+    return room ? { player: mapPlayer(row), room } : null;
   }
 
   addAIPlayers(roomId: string, requestedNames: Array<string | null>, maximumPlayers = 12): Player[] {

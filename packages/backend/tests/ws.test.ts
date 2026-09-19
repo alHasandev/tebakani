@@ -223,7 +223,7 @@ describe("WebSocket presence & multi-connection integration", () => {
   });
 
   it("completes a two-human game and ensures every connected tab receives exactly one game_finished event with safe payload", async () => {
-    const { app, repo, db } = createApp(":memory:", undefined, { moderator: new FakeModerator() });
+    const { app, repo, db, awaitEvaluations } = createApp(":memory:", undefined, { moderator: new FakeModerator() });
     const server = app.listen(0);
     const port = server.server?.port;
 
@@ -286,6 +286,8 @@ describe("WebSocket presence & multi-connection integration", () => {
         body: JSON.stringify({ expectedTurnId: turnId, question: "First player question?" })
       })
     );
+    await awaitEvaluations();
+    db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turnId]);
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/close-answers`, {
         method: "POST",
@@ -320,6 +322,8 @@ describe("WebSocket presence & multi-connection integration", () => {
         body: JSON.stringify({ expectedTurnId: turn2Id, question: "Second player question?" })
       })
     );
+    await awaitEvaluations();
+    db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turn2Id]);
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/close-answers`, {
         method: "POST",
@@ -383,8 +387,16 @@ describe("WebSocket presence & multi-connection integration", () => {
 
     const host = repo.createRoom("RecHost");
     const guest = repo.joinRoom(host.room.code, "RecGuest");
+    const observer = repo.joinRoom(host.room.code, "RecObserver");
     expect(guest.status).toBe("success");
-    if (guest.status !== "success") return;
+    expect(observer.status).toBe("success");
+    if (guest.status !== "success" || observer.status !== "success") return;
+
+    const allPlayers = [
+      { id: host.player.id, token: host.sessionToken },
+      { id: guest.player.id, token: guest.sessionToken },
+      { id: observer.player.id, token: observer.sessionToken },
+    ];
 
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/start`, {
@@ -401,11 +413,11 @@ describe("WebSocket presence & multi-connection integration", () => {
     const game = await gameRes.json();
     const turnId = game.currentTurn.id;
     const activePlayerId = game.currentTurn.activePlayerId;
-    const activeToken = activePlayerId === host.player.id ? host.sessionToken : guest.sessionToken;
-    const nonActivePlayerId = activePlayerId === host.player.id ? guest.player.id : host.player.id;
-    const nonActiveToken = activePlayerId === host.player.id ? guest.sessionToken : host.sessionToken;
+    const activeToken = allPlayers.find((p) => p.id === activePlayerId)!.token;
+    const nonActive = allPlayers.find((p) => p.id !== activePlayerId)!;
+    const nonActivePlayerId = nonActive.id;
+    const nonActiveToken = nonActive.token;
 
-    // Ask question
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/question`, {
         method: "POST",
@@ -414,7 +426,6 @@ describe("WebSocket presence & multi-connection integration", () => {
       })
     );
 
-    // Non-active player submits answer "maybe"
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/answer`, {
         method: "POST",
@@ -423,7 +434,6 @@ describe("WebSocket presence & multi-connection integration", () => {
       })
     );
 
-    // Non-active player reconnects over WS
     const reconnectedWs = new WebSocket(`ws://localhost:${port}/ws?token=${nonActiveToken}`);
     const messages: any[] = [];
     reconnectedWs.onmessage = (e) => messages.push(JSON.parse(e.data.toString()));

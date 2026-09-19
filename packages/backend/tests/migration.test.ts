@@ -200,7 +200,7 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
 
     // Verify user_version is 9
     const versionRow = db.prepare("PRAGMA user_version;").get() as { user_version: number };
-    expect(versionRow.user_version).toBe(12);
+    expect(versionRow.user_version).toBe(16);
     const stateColumns = db.prepare("PRAGMA table_info(player_game_state);").all() as Array<{ name: string }>;
     expect(stateColumns.some((column) => column.name === "point_balance")).toBe(true);
     expect(db.prepare("SELECT point_balance FROM player_game_state WHERE game_id = ?").all(gameId).every((row: any) => row.point_balance === 0)).toBe(true);
@@ -224,7 +224,7 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     db.close();
 
     const reopened = createDatabase(testDbPath);
-    expect((reopened.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(12);
+    expect((reopened.prepare("PRAGMA user_version").get() as { user_version: number }).user_version).toBe(16);
     expect(reopened.prepare("SELECT COUNT(*) count FROM games").get()).toEqual({ count: 2 });
     expect(reopened.prepare("SELECT COUNT(*) count FROM player_game_state").get()).toEqual({ count: 2 });
     reopened.close();
@@ -266,11 +266,11 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     const turnId = randomUUID();
     const questionId = randomUUID();
     const timestamp = "2026-09-18T12:00:00.000Z";
-    seeded.run("INSERT INTO rooms VALUES (?, 'V7DATA', ?)", [roomId, timestamp]);
+    seeded.run("INSERT INTO rooms (id, code, created_at) VALUES (?, 'V7DATA', ?)", [roomId, timestamp]);
     seeded.run("INSERT INTO players VALUES (?, ?, 'Player', 'human', 1, 'v7-token', 0, ?)", [playerId, roomId, timestamp]);
     seeded.run("INSERT INTO games (id, room_id, status, current_turn_player_id, created_at, started_at, finished_at, state_revision) VALUES (?, ?, 'playing', ?, ?, ?, NULL, 0)", [gameId, roomId, playerId, timestamp, timestamp]);
     seeded.run("INSERT INTO player_game_state VALUES (?, ?, ?, 'char', 'Name', 'Series', NULL, 'Description', 0, 0, NULL, 3, NULL)", [randomUUID(), gameId, playerId]);
-    seeded.run("INSERT INTO game_turns VALUES (?, ?, ?, 1, 'awaiting_guess', 1, ?, NULL)", [turnId, gameId, playerId, timestamp]);
+    seeded.run("INSERT INTO game_turns (id, game_id, active_player_id, turn_number, phase, is_active, started_at, ended_at) VALUES (?, ?, ?, 1, 'awaiting_guess', 1, ?, NULL)", [turnId, gameId, playerId, timestamp]);
     seeded.run("INSERT INTO questions (id, turn_id, asking_player_id, question_text, asked_at, moderator_status, moderator_answer, moderator_error, moderator_claim_token, moderator_attempts, moderated_at, moderator_revision) VALUES (?, ?, ?, 'Q?', ?, 'answered', 'yes', NULL, NULL, 1, ?, 1)", [questionId, turnId, playerId, timestamp, timestamp]);
     replaceEconomyWithV7(seeded);
     seeded.run("INSERT INTO purchased_hints VALUES ('hint-a', ?, ?, 'basic_name', '\"clue\"', 5, ?)", [gameId, playerId, timestamp]);
@@ -281,7 +281,7 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     seeded.close();
 
     const migrated = createDatabase(testDbPath);
-    expect((migrated.prepare("PRAGMA user_version").get() as any).user_version).toBe(12);
+    expect((migrated.prepare("PRAGMA user_version").get() as any).user_version).toBe(16);
     expect(migrated.prepare("SELECT id, hint_type, cost FROM purchased_hints ORDER BY id").all()).toEqual([
       { id: "hint-a", hint_type: "basic", cost: 5 },
       { id: "hint-b", hint_type: "series", cost: 2 }
@@ -297,7 +297,7 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     migrated.close();
 
     const reopened = createDatabase(testDbPath);
-    expect((reopened.prepare("PRAGMA user_version").get() as any).user_version).toBe(12);
+    expect((reopened.prepare("PRAGMA user_version").get() as any).user_version).toBe(16);
     expect(reopened.prepare("SELECT COUNT(*) count FROM point_ledger").get()).toEqual({ count: 3 });
     expect(reopened.prepare("PRAGMA foreign_key_check").all()).toHaveLength(0);
     reopened.close();
@@ -343,7 +343,7 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     raw.close();
 
     const migrated = createDatabase(testDbPath);
-    expect((migrated.prepare("PRAGMA user_version").get() as any).user_version).toBe(12);
+    expect((migrated.prepare("PRAGMA user_version").get() as any).user_version).toBe(16);
     expect(migrated.prepare("SELECT id, hint_type, cost FROM purchased_hints").all()).toEqual([{ id: hintId, hint_type: "basic", cost: 5 }]);
     expect(migrated.prepare("SELECT id, question_id, hint_purchase_id, amount, reason FROM point_ledger ORDER BY amount").all()).toEqual([
       { id: ledgerHintId, question_id: null, hint_purchase_id: hintId, amount: -5, reason: "hint_purchase" },
@@ -354,7 +354,7 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     migrated.close();
 
     const reopened = createDatabase(testDbPath);
-    expect((reopened.prepare("PRAGMA user_version").get() as any).user_version).toBe(12);
+    expect((reopened.prepare("PRAGMA user_version").get() as any).user_version).toBe(16);
     expect(reopened.prepare("SELECT COUNT(*) count FROM point_ledger").get()).toEqual({ count: 2 });
     expect(reopened.prepare("PRAGMA foreign_key_check").all()).toHaveLength(0);
     reopened.close();
@@ -391,11 +391,58 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     raw.run("INSERT INTO point_ledger VALUES ('pl-bad', ?, ?, NULL, 'ph-bad', -5, 'hint_purchase', ?)", [gameId, playerId, timestamp]);
     raw.close();
 
-    expect(() => createDatabase(testDbPath)).toThrow("Cannot advance v8 economy schema: existing data failed validation");
+    expect(() => createDatabase(testDbPath)).toThrow("Cannot migrate v7 economy: mixed or unrecognized partial schema state");
     const check = new Database(testDbPath);
     expect((check.prepare("PRAGMA user_version").get() as any).user_version).toBe(7);
     check.close();
     cleanup();
+  });
+
+  it("repairs a v12 basic_name constraint while preserving linked history and permits BASIC over HTTP", async () => {
+    cleanup();
+    const seededApp = createApp(testDbPath, undefined, { moderator: new FakeModerator("yes") });
+    const { app, repo, gameRepo, turnRepo } = seededApp;
+    const seeded = seededApp.db;
+    const host = repo.createRoom("Host");
+    const guest = repo.joinRoom(host.room.code, "Guest");
+    if (guest.status !== "success") throw new Error("setup failed");
+    await app.handle(new Request(`http://localhost/rooms/${host.room.code}/start`, { method: "POST", headers: { Authorization: `Bearer ${host.sessionToken}` } }));
+    const game = gameRepo.getGameByRoomId(host.room.id)!;
+    const turn = turnRepo.getActiveTurn(game.id)!;
+    const active = turn.turn.activePlayerId === host.player.id ? host : guest;
+    const timestamp = "2026-09-19T02:00:00.000Z";
+    seeded.run("UPDATE player_game_state SET point_balance = 6 WHERE game_id = ? AND player_id = ?", [game.id, active.player.id]);
+    seeded.run("INSERT INTO purchased_hints (id, game_id, player_id, hint_type, hint_value, cost, purchased_at) VALUES ('legacy-hint', ?, ?, 'series', '\"One Piece\"', 2, ?)", [game.id, active.player.id, timestamp]);
+    seeded.run("INSERT INTO point_ledger VALUES ('legacy-ledger', ?, ?, NULL, 'legacy-hint', -2, 'hint_purchase', ?)", [game.id, active.player.id, timestamp]);
+    seeded.run("PRAGMA foreign_keys = OFF; DROP TRIGGER game_revision_hint_insert; CREATE TABLE purchased_hints_v12 (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, player_id TEXT NOT NULL, hint_type TEXT NOT NULL CHECK(hint_type IN ('basic_name', 'series', 'candidates')), hint_value TEXT NOT NULL, cost INTEGER NOT NULL CHECK(typeof(cost) = 'integer' AND cost > 0), purchased_at TEXT NOT NULL, FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE, FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE, UNIQUE(game_id, player_id, hint_type)); INSERT INTO purchased_hints_v12 SELECT id, game_id, player_id, CASE hint_type WHEN 'basic' THEN 'basic_name' ELSE hint_type END, hint_value, cost, purchased_at FROM purchased_hints; DROP TABLE purchased_hints; ALTER TABLE purchased_hints_v12 RENAME TO purchased_hints; PRAGMA user_version = 12;");
+    seeded.close();
+
+    const migrated = createDatabase(testDbPath);
+    expect((migrated.prepare("PRAGMA user_version").get() as any).user_version).toBe(16);
+    expect(migrated.prepare("SELECT id, hint_type FROM purchased_hints").all()).toEqual([{ id: "legacy-hint", hint_type: "series" }]);
+    expect(migrated.prepare("SELECT hint_purchase_id FROM point_ledger WHERE id = 'legacy-ledger'").get()).toEqual({ hint_purchase_id: "legacy-hint" });
+    expect(migrated.prepare("PRAGMA foreign_key_check").all()).toHaveLength(0);
+    migrated.close();
+
+    const reopened = createApp(testDbPath, undefined, { moderator: new FakeModerator("yes") });
+    await reopened.app.handle(new Request(`http://localhost/rooms/${host.room.code}/game/question`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${active.sessionToken}` }, body: JSON.stringify({ expectedTurnId: turn.turn.id, question: "Q?" }) }));
+    await reopened.awaitEvaluations();
+    const response = await reopened.app.handle(new Request(`http://localhost/rooms/${host.room.code}/game/hints`, { method: "POST", headers: { "Content-Type": "application/json", Authorization: `Bearer ${active.sessionToken}` }, body: JSON.stringify({ expectedTurnId: turn.turn.id, type: "basic" }) }));
+    expect(response.status).toBe(200);
+    reopened.db.close();
+    cleanup();
+  });
+
+  it("fresh schema accepts basic, rejects basic_name, and links hint purchases to turns", () => {
+    const db = createDatabase(":memory:");
+    expect((db.prepare("PRAGMA user_version").get() as any).user_version).toBe(16);
+    const sql = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'purchased_hints'").get() as { sql: string }).sql;
+    expect(sql).toContain("'basic', 'series', 'candidates'");
+    expect(sql).not.toContain("basic_name");
+    const columns = db.prepare("PRAGMA table_info(purchased_hints)").all() as Array<{ name: string }>;
+    expect(columns.some((column) => column.name === "turn_id")).toBe(true);
+    expect(() => db.run("INSERT INTO purchased_hints (id, game_id, player_id, hint_type, hint_value, cost, purchased_at) VALUES ('x', 'g', 'p', 'basic_name', '\"x\"', 1, 'now')")).toThrow();
+    db.close();
   });
 
   it("rejects unmatched v7 hint ledger rows atomically without dropping history", () => {
@@ -405,7 +452,7 @@ describe("SQLite schema migration idempotency & data preservation through v5", (
     const playerId = randomUUID();
     const gameId = randomUUID();
     const timestamp = "2026-09-18T13:00:00.000Z";
-    seeded.run("INSERT INTO rooms VALUES (?, 'V7BAD1', ?)", [roomId, timestamp]);
+    seeded.run("INSERT INTO rooms (id, code, created_at) VALUES (?, 'V7BAD1', ?)", [roomId, timestamp]);
     seeded.run("INSERT INTO players VALUES (?, ?, 'Player', 'human', 1, 'v7-bad-token', 0, ?)", [playerId, roomId, timestamp]);
     seeded.run("INSERT INTO games (id, room_id, status, current_turn_player_id, created_at, started_at, finished_at, state_revision) VALUES (?, ?, 'playing', ?, ?, ?, NULL, 0)", [gameId, roomId, playerId, timestamp, timestamp]);
     seeded.run("INSERT INTO player_game_state VALUES (?, ?, ?, 'char', 'Name', 'Series', NULL, 'Description', 0, 0, NULL, 0, NULL)", [randomUUID(), gameId, playerId]);

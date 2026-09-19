@@ -29,7 +29,8 @@ export const LOCAL_CHARACTERS: CharacterSummary[] = [
     id: "char-05",
     name: "Goku",
     series: "Dragon Ball",
-    description: "Saiyan warrior defending Earth and striving for greater strength."
+    description: "Saiyan warrior defending Earth and striving for greater strength.",
+    knowledge: { aliases: ["Son Goku", "Sun Goku", "Kakarot", "Kakarotto"] }
   },
   {
     id: "char-06",

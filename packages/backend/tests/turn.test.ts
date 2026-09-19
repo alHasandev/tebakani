@@ -146,11 +146,13 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
   });
 
   it("handles question asking, answers upsert, and closing answers with permission checks", async () => {
-    const { app, repo } = createApp(":memory:", undefined, { moderator: new FakeModerator() });
+    const { app, repo, db, awaitEvaluations } = createApp(":memory:", undefined, { moderator: new FakeModerator() });
     const host = repo.createRoom("HostP");
     const guest = repo.joinRoom(host.room.code, "GuestP");
+    const guest2 = repo.joinRoom(host.room.code, "GuestP2");
     expect(guest.status).toBe("success");
-    if (guest.status !== "success") return;
+    expect(guest2.status).toBe("success");
+    if (guest.status !== "success" || guest2.status !== "success") return;
 
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/start`, {
@@ -167,8 +169,9 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
     const gameData = await hostViewRes.json();
     const turnId = gameData.currentTurn.id;
     const activePlayerId = gameData.currentTurn.activePlayerId;
-    const activeToken = activePlayerId === host.player.id ? host.sessionToken : guest.sessionToken;
-    const nonActiveToken = activePlayerId === host.player.id ? guest.sessionToken : host.sessionToken;
+    const participants = [host, guest, guest2];
+    const activeToken = participants.find((participant) => participant.player.id === activePlayerId)!.sessionToken;
+    const nonActiveToken = participants.find((participant) => participant.player.id !== activePlayerId)!.sessionToken;
 
     // 1. Non-active player cannot ask question (403)
     const badAskRes = await app.handle(
@@ -240,6 +243,7 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
     const ans1Data = await ans1.json();
     expect(ans1Data.currentTurn.question.answers).toHaveLength(1);
     expect(ans1Data.currentTurn.question.answers[0].answer).toBe("yes");
+    await awaitEvaluations();
 
     // 6. Non-active player updates answer to "maybe" (upsert - still 1 row)
     const ans2 = await app.handle(
@@ -256,6 +260,7 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
     const ans2Data = await ans2.json();
     expect(ans2Data.currentTurn.question.answers).toHaveLength(1);
     expect(ans2Data.currentTurn.question.answers[0].answer).toBe("maybe");
+    db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turnId]);
 
     // 7. Non-active player cannot close answers (403)
     const badCloseRes = await app.handle(
@@ -297,7 +302,7 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
   });
 
   it("handles incorrect guess, pass, correct guess, circular turn advance skipping completed players, and finishing game", async () => {
-    const { app, repo, db } = createApp(":memory:", undefined, { moderator: new FakeModerator() });
+    const { app, repo, db, awaitEvaluations } = createApp(":memory:", undefined, { moderator: new FakeModerator() });
     const host = repo.createRoom("HostG");
     const guest = repo.joinRoom(host.room.code, "GuestG");
     expect(guest.status).toBe("success");
@@ -333,6 +338,8 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
         body: JSON.stringify({ expectedTurnId: turnId, question: "Am I human?" })
       })
     );
+    await awaitEvaluations();
+    db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turnId]);
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/close-answers`, {
         method: "POST",
@@ -373,6 +380,8 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
         body: JSON.stringify({ expectedTurnId: turn2Id, question: "Is my character strong?" })
       })
     );
+    await awaitEvaluations();
+    db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turn2Id]);
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/close-answers`, {
         method: "POST",
@@ -404,6 +413,8 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
         body: JSON.stringify({ expectedTurnId: turn3Id, question: "Am I " + firstCharName + "?" })
       })
     );
+    await awaitEvaluations();
+    db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turn3Id]);
     await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/close-answers`, {
         method: "POST",
@@ -454,6 +465,7 @@ describe("Milestone 3 Turn Loop, Guessing, Answers, Concurrency & Completion", (
         body: JSON.stringify({ expectedTurnId: turn4Id, question: "Final question" })
       })
     );
+    await awaitEvaluations();
 
     const completedAnswer = await app.handle(
       new Request(`http://localhost/rooms/${host.room.code}/game/answer`, {

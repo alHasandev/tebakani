@@ -404,9 +404,11 @@ export function createDatabase(dbPath = ":memory:") {
     const ledgerIsV8 = hasColumns(ledgerColumns, ["id", "game_id", "player_id", "question_id", "hint_purchase_id", "amount", "reason", "created_at"])
       && !ledgerColumns.has("turn_id");
     const hintsHaveExpectedColumns = hasColumns(hintColumns, ["id", "game_id", "player_id", "hint_type", "hint_value", "cost", "purchased_at"]);
+    const hintsSql = (db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'purchased_hints'").get() as { sql: string } | null)?.sql ?? "";
+    const hintsHaveKnownConstraint = /CHECK\s*\(\s*hint_type\s+IN\s*\(\s*'basic(?:_name)?'\s*,\s*'series'\s*,\s*'candidates'\s*\)\s*\)/i.test(hintsSql);
     const temporaryTables = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('point_ledger_v8', 'purchased_hints_v7', 'purchased_hints_v8') LIMIT 1").get();
 
-    if (temporaryTables || !hintsHaveExpectedColumns || (!ledgerIsV7 && !ledgerIsV8)) {
+    if (temporaryTables || !hintsHaveExpectedColumns || !hintsHaveKnownConstraint || (!ledgerIsV7 && !ledgerIsV8)) {
       throw new Error("Cannot migrate v7 economy: mixed or unrecognized partial schema state");
     }
 
@@ -425,7 +427,7 @@ export function createDatabase(dbPath = ":memory:") {
       const invalidV8Hints = db.prepare(`
         SELECT ph.id FROM purchased_hints ph
         LEFT JOIN point_ledger pl ON pl.hint_purchase_id = ph.id AND pl.reason = 'hint_purchase'
-        WHERE ph.hint_type NOT IN ('basic', 'series', 'candidates') OR ph.cost <= 0 OR pl.id IS NULL
+        WHERE ph.hint_type NOT IN ('basic', 'basic_name', 'series', 'candidates') OR ph.cost <= 0 OR pl.id IS NULL
         LIMIT 1
       `).get();
       const inconsistentV8Balance = db.prepare(`
@@ -705,6 +707,105 @@ export function createDatabase(dbPath = ":memory:") {
     `);
   });
   if (currentVersion < 12) migrateV12();
+
+  const migrateV13 = db.transaction(() => {
+    const table = db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'purchased_hints'").get() as { sql: string } | null;
+    if (!table) throw new Error("Cannot repair v13 economy: purchased_hints is missing");
+    const hasLegacyConstraint = /basic_name/i.test(table.sql);
+    const hasLegacyRows = Boolean(db.prepare("SELECT id FROM purchased_hints WHERE hint_type = 'basic_name' LIMIT 1").get());
+    const hasCurrentConstraint = /CHECK\s*\(\s*hint_type\s+IN\s*\(\s*'basic'\s*,\s*'series'\s*,\s*'candidates'\s*\)\s*\)/i.test(table.sql);
+    const invalid = db.prepare("SELECT id FROM purchased_hints WHERE hint_type NOT IN ('basic', 'basic_name', 'series', 'candidates') LIMIT 1").get();
+    if (invalid) throw new Error("Cannot repair v13 economy: purchased_hints contains an invalid hint type");
+    if (hasLegacyConstraint || hasLegacyRows || !hasCurrentConstraint) {
+      db.run(`
+        DROP TRIGGER IF EXISTS game_revision_hint_insert;
+        CREATE TABLE purchased_hints_v13 (
+          id TEXT PRIMARY KEY,
+          game_id TEXT NOT NULL,
+          player_id TEXT NOT NULL,
+          hint_type TEXT NOT NULL CHECK(hint_type IN ('basic', 'series', 'candidates')),
+          hint_value TEXT NOT NULL,
+          cost INTEGER NOT NULL CHECK(typeof(cost) = 'integer' AND cost > 0),
+          purchased_at TEXT NOT NULL,
+          FOREIGN KEY(game_id) REFERENCES games(id) ON DELETE CASCADE,
+          FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE,
+          UNIQUE(game_id, player_id, hint_type)
+        );
+        INSERT INTO purchased_hints_v13 (id, game_id, player_id, hint_type, hint_value, cost, purchased_at)
+        SELECT id, game_id, player_id, CASE hint_type WHEN 'basic_name' THEN 'basic' ELSE hint_type END, hint_value, cost, purchased_at
+        FROM purchased_hints;
+        DROP TABLE purchased_hints;
+        ALTER TABLE purchased_hints_v13 RENAME TO purchased_hints;
+        CREATE INDEX idx_purchased_hints_game_player ON purchased_hints(game_id, player_id, purchased_at);
+        CREATE TRIGGER game_revision_hint_insert AFTER INSERT ON purchased_hints BEGIN UPDATE games SET state_revision = state_revision + 1 WHERE id = NEW.game_id; END;
+      `);
+    }
+    db.run("PRAGMA user_version = 13;");
+  });
+  if (currentVersion < 13) migrateV13();
+
+  const migrateV14 = db.transaction(() => {
+    const columns = (table: string) => new Set((db.prepare(`PRAGMA table_info(${table});`).all() as Array<{ name: string }>).map((column) => column.name));
+    const roomColumns = columns("rooms");
+    const gameColumns = columns("games");
+    const questionColumns = columns("questions");
+    const turnColumns = columns("game_turns");
+    if (!roomColumns.has("answer_duration_seconds")) db.run("ALTER TABLE rooms ADD COLUMN answer_duration_seconds INTEGER NOT NULL DEFAULT 60 CHECK(typeof(answer_duration_seconds) = 'integer' AND answer_duration_seconds BETWEEN 15 AND 300);");
+    if (!gameColumns.has("answer_duration_seconds")) db.run("ALTER TABLE games ADD COLUMN answer_duration_seconds INTEGER NOT NULL DEFAULT 60 CHECK(typeof(answer_duration_seconds) = 'integer' AND answer_duration_seconds BETWEEN 15 AND 300);");
+    if (!questionColumns.has("answer_deadline_at")) db.run("ALTER TABLE questions ADD COLUMN answer_deadline_at TEXT;");
+    if (!turnColumns.has("outcome")) db.run("ALTER TABLE game_turns ADD COLUMN outcome TEXT CHECK(outcome IN ('guessed', 'passed', 'skipped'));");
+    db.run("UPDATE rooms SET answer_duration_seconds = 60 WHERE answer_duration_seconds IS NULL;");
+    db.run("UPDATE games SET answer_duration_seconds = 60 WHERE answer_duration_seconds IS NULL;");
+    db.run(`
+      UPDATE questions SET answer_deadline_at = datetime(
+        asked_at,
+        '+' || COALESCE((SELECT g.answer_duration_seconds FROM game_turns gt JOIN games g ON g.id = gt.game_id WHERE gt.id = questions.turn_id), 60) || ' seconds'
+      ) WHERE answer_deadline_at IS NULL;
+    `);
+    db.run("PRAGMA user_version = 14;");
+  });
+  if (currentVersion < 14) migrateV14();
+
+  const migrateV15 = db.transaction(() => {
+    db.run(`
+      UPDATE questions
+      SET answer_deadline_at = strftime(
+        '%Y-%m-%dT%H:%M:%fZ',
+        asked_at,
+        '+' || COALESCE((
+          SELECT g.answer_duration_seconds
+          FROM game_turns gt JOIN games g ON g.id = gt.game_id
+          WHERE gt.id = questions.turn_id
+        ), 60) || ' seconds'
+      );
+      UPDATE game_turns
+      SET outcome = 'guessed'
+      WHERE outcome IS NULL AND EXISTS (SELECT 1 FROM guess_attempts ga WHERE ga.turn_id = game_turns.id);
+      PRAGMA user_version = 15;
+    `);
+  });
+  if (currentVersion < 15) migrateV15();
+
+  const migrateV16 = db.transaction(() => {
+    const columns = new Set((db.prepare("PRAGMA table_info(purchased_hints);").all() as Array<{ name: string }>).map((column) => column.name));
+    if (!columns.has("turn_id")) db.run("ALTER TABLE purchased_hints ADD COLUMN turn_id TEXT REFERENCES game_turns(id) ON DELETE CASCADE;");
+    db.run(`
+      UPDATE purchased_hints
+      SET turn_id = (
+        SELECT gt.id FROM game_turns gt
+        WHERE gt.game_id = purchased_hints.game_id
+          AND gt.active_player_id = purchased_hints.player_id
+          AND gt.started_at <= purchased_hints.purchased_at
+          AND (gt.ended_at IS NULL OR purchased_hints.purchased_at <= gt.ended_at)
+        ORDER BY gt.started_at DESC, gt.turn_number DESC
+        LIMIT 1
+      )
+      WHERE turn_id IS NULL;
+      CREATE INDEX IF NOT EXISTS idx_purchased_hints_turn ON purchased_hints(turn_id, purchased_at);
+      PRAGMA user_version = 16;
+    `);
+  });
+  if (currentVersion < 16) migrateV16();
 
   db.run("DELETE FROM ai_activity;");
   

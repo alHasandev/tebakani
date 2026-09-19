@@ -18,6 +18,7 @@ export interface Player {
 export interface Room {
   id: string;
   code: string;
+  answerDurationSeconds: number;
   createdAt: string;
 }
 
@@ -96,11 +97,38 @@ export interface TurnQuestionView {
   id: string;
   questionText: string;
   askedAt: string;
+  answerDeadlineAt: string;
   moderatorStatus: ModeratorStatus;
   moderatorAnswer: AnswerValue | null;
   moderatorRevision: number;
+  eligibleAnswererCount: number;
+  answeredCount: number;
   answers: TurnAnswerView[];
   awards: TurnPointAwardView[];
+}
+
+export interface TurnHintPurchaseView {
+  id: string;
+  playerId: string;
+  playerName: string;
+  playerType: PlayerType;
+  hintType: HintType;
+  cost: number;
+  purchasedAt: string;
+}
+
+export interface PublicTurnHistory {
+  turnId: string;
+  turnNumber: number;
+  activePlayerId: string;
+  activePlayerName: string;
+  activePlayerType: PlayerType;
+  question: TurnQuestionView | null;
+  outcome: "guessed" | "passed" | "skipped" | "unknown" | null;
+  guess: { characterName: string; correct: boolean; attemptedAt: string } | null;
+  hintPurchases: TurnHintPurchaseView[];
+  startedAt: string;
+  endedAt: string | null;
 }
 
 export interface CurrentTurnView {
@@ -157,8 +185,11 @@ export interface GameView {
   roomCode: string;
   status: GameStatus;
   revision: number;
+  serverTime: string;
   currentTurnPlayerId: string | null;
   currentTurn: CurrentTurnView | null;
+  answerDurationSeconds: number;
+  history: PublicTurnHistory[];
   players: GamePlayerStateView[];
   ownLedger: PointLedgerEntry[];
   ownHints: PurchasedHint[];

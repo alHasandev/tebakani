@@ -163,7 +163,7 @@ describe("Milestone 4 AI moderation and lobby management", () => {
     moderator.answer("yes");
     await awaitEvaluations();
     const answered = await (await app.handle(new Request(`http://localhost/rooms/${host.room.code}/game`, { headers: { Authorization: `Bearer ${activeToken}` } }))).json();
-    expect(answered.currentTurn.question).toMatchObject({ moderatorStatus: "answered", moderatorAnswer: "yes", moderatorRevision: 2 });
+    expect(answered.currentTurn.question).toMatchObject({ moderatorStatus: "answered", moderatorAnswer: null, moderatorRevision: 2 });
     expect(JSON.stringify(answered)).not.toContain("moderator_error");
     expect(JSON.stringify(answered)).not.toContain("moderator_claim_token");
   });

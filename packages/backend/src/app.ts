@@ -64,7 +64,8 @@ export function createApp(
   characterSource ??= createCharacterSource(db);
   const repo = new RoomRepository(db);
   const gameRepo = new GameRepository(db);
-  const turnRepo = new TurnRepository(db);
+  const runtime = dependencies.aiRuntime ?? defaultAIRuntime;
+  const turnRepo = new TurnRepository(db, runtime.now);
   const moderator = dependencies.moderator ?? new LazyProductionModerator();
   const economyRepo = new EconomyRepository(db);
   const hintService = new HintService(characterSource, economyRepo);
@@ -106,7 +107,8 @@ export function createApp(
         economyRepo.getLedger(game.id, ps.playerId),
         economyRepo.getHints(game.id, ps.playerId),
         aiActivity.get(game.id, turnDetails?.turn.id ?? null).activity,
-        aiActivity.get(game.id, turnDetails?.turn.id ?? null).lastAction
+        aiActivity.get(game.id, turnDetails?.turn.id ?? null).lastAction,
+        turnRepo.listHistory(game.id)
       );
       app.server?.publish(
         `player:${ps.playerId}`,
@@ -118,7 +120,7 @@ export function createApp(
     }
   }
 
-  aiRunner = new AIPlayerRunner(gameRepo, turnRepo, gameService, aiContexts, aiActivity, dependencies.aiPlayerAgent ?? new LazyProductionAIPlayerAgent(), aiConfig, dependencies.aiRuntime ?? defaultAIRuntime, { stateChanged: broadcastGameState, evaluateQuestion: scheduleEvaluation });
+  aiRunner = new AIPlayerRunner(gameRepo, turnRepo, gameService, aiContexts, aiActivity, dependencies.aiPlayerAgent ?? new LazyProductionAIPlayerAgent(), aiConfig, runtime, { stateChanged: broadcastGameState, evaluateQuestion: scheduleEvaluation });
 
   function stateChanged(code: string, finished = false) {
     broadcastGameState(code, finished);
@@ -252,6 +254,27 @@ export function createApp(
         })
       }
     )
+    .patch(
+      "/rooms/:code/settings/answer-timer",
+      ({ params, headers, body, set }) => {
+        const code = params.code.trim().toUpperCase();
+        const token = parseBearerToken(headers);
+        if (!token) throw new DomainError(401, "Missing or invalid authorization header");
+        const auth = repo.authenticatePlayer(token);
+        if (!auth) throw new DomainError(401, "Unauthorized session token");
+        if (auth.room.code !== code) throw new DomainError(403, "Session does not belong to this room");
+        if (gameService.isRoomStarting(code)) throw new DomainError(409, "Answer timer cannot be changed while game is starting");
+        const room = repo.updateAnswerDuration(auth.room.id, auth.player.id, body.answerDurationSeconds);
+        const lobbyState: LobbyState = { room, players: repo.getPlayers(room.id) };
+        app.server?.publish(`room:${code}`, JSON.stringify({ type: "lobby_update", data: lobbyState }));
+        set.status = 200;
+        return lobbyState;
+      },
+      {
+        params: t.Object({ code: t.String() }),
+        body: t.Object({ answerDurationSeconds: t.Integer({ minimum: 15, maximum: 300 }) })
+      }
+    )
     .post(
       "/rooms/:code/start",
       async ({ params, headers, set }) => {
@@ -271,7 +294,7 @@ export function createApp(
         const turnDetails = turnRepo.getActiveTurn(game.id);
 
         for (const ps of playerStates) {
-          const playerView = serializeGameForViewer(game, playerStates, ps.playerId, turnDetails);
+          const playerView = serializeGameForViewer(game, playerStates, ps.playerId, turnDetails, [], [], [], null, turnRepo.listHistory(game.id));
           app.server?.publish(
             `player:${ps.playerId}`,
             JSON.stringify({

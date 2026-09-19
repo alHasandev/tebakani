@@ -43,7 +43,7 @@ describe("Milestone 5 economy and hints", () => {
       post(ctx.app, `${base}/close-answers`, ctx.activeAuth.sessionToken, { expectedTurnId: ctx.active.turn.id }),
       post(ctx.app, `${base}/close-answers`, ctx.activeAuth.sessionToken, { expectedTurnId: ctx.active.turn.id })
     ]);
-    expect([first.status, second.status].sort()).toEqual([200, 409]);
+    expect([first.status, second.status].sort()).toEqual([409, 409]);
     const state = ctx.db.prepare("SELECT point_balance FROM player_game_state WHERE game_id = ? AND player_id = ?").get(ctx.game.id, ctx.answererAuth.player.id) as any;
     expect(state.point_balance).toBe(1);
     const question = ctx.db.prepare("SELECT id FROM questions WHERE turn_id = ?").get(ctx.active.turn.id) as any;
@@ -125,6 +125,37 @@ describe("Milestone 5 economy and hints", () => {
     expect(ctx.db.prepare("SELECT * FROM purchased_hints").all()).toHaveLength(0);
   });
 
+  it("uses legacy character columns when snapshot JSON is null or malformed", async () => {
+    for (const snapshot of [null, "null", "{}", "not-json"]) {
+      const ctx = await setup();
+      await openQuestion(ctx);
+      ctx.db.run("UPDATE player_game_state SET character_name = 'Safe Hero', character_series = 'Series', character_description = 'A resilient rubber pirate captain.', character_snapshot_json = ?, point_balance = 10 WHERE game_id = ? AND player_id = ?", [snapshot, ctx.game.id, ctx.activeAuth.player.id]);
+      const response = await post(ctx.app, `http://localhost/rooms/${ctx.host.room.code}/game/hints`, ctx.activeAuth.sessionToken, { expectedTurnId: ctx.active.turn.id, type: "basic" });
+      expect(response.status).toBe(200);
+    }
+  });
+
+  it("does not redact a single-letter middle initial inside unrelated words", async () => {
+    const ctx = await setup();
+    await openQuestion(ctx);
+    ctx.db.run("UPDATE player_game_state SET assigned_character_id = 'luffy', character_name = 'Monkey D. Luffy', character_description = 'A resilient rubber pirate captain.', character_snapshot_json = ?, point_balance = 10 WHERE game_id = ? AND player_id = ?", [JSON.stringify({ id: "luffy", name: "Monkey D. Luffy", series: "One Piece", description: "A resilient rubber pirate captain." }), ctx.game.id, ctx.activeAuth.player.id]);
+    const response = await post(ctx.app, `http://localhost/rooms/${ctx.host.room.code}/game/hints`, ctx.activeAuth.sessionToken, { expectedTurnId: ctx.active.turn.id, type: "basic" });
+    expect(response.status).toBe(200);
+    expect((await response.json()).hint.value).toBe("A resilient rubber pirate captain.");
+  });
+
+  it("rolls back the balance when persistence fails after deduction", async () => {
+    const ctx = await setup();
+    await openQuestion(ctx);
+    ctx.db.run("UPDATE player_game_state SET point_balance = 10 WHERE game_id = ? AND player_id = ?", [ctx.game.id, ctx.activeAuth.player.id]);
+    ctx.db.run("CREATE TRIGGER reject_hint BEFORE INSERT ON purchased_hints BEGIN SELECT RAISE(ABORT, 'forced failure'); END;");
+    const response = await post(ctx.app, `http://localhost/rooms/${ctx.host.room.code}/game/hints`, ctx.activeAuth.sessionToken, { expectedTurnId: ctx.active.turn.id, type: "series" });
+    expect(response.status).toBe(500);
+    expect(ctx.db.prepare("SELECT point_balance FROM player_game_state WHERE game_id = ? AND player_id = ?").get(ctx.game.id, ctx.activeAuth.player.id)).toEqual({ point_balance: 10 });
+    expect(ctx.db.prepare("SELECT COUNT(*) count FROM purchased_hints").get()).toEqual({ count: 0 });
+    expect(ctx.db.prepare("SELECT COUNT(*) count FROM point_ledger").get()).toEqual({ count: 0 });
+  });
+
   it("rejects completed purchases with 403 and validates corrupted persisted hint JSON", async () => {
     const ctx = await setup();
     await openQuestion(ctx);
@@ -132,7 +163,7 @@ describe("Milestone 5 economy and hints", () => {
     const response = await post(ctx.app, `http://localhost/rooms/${ctx.host.room.code}/game/hints`, ctx.activeAuth.sessionToken, { expectedTurnId: ctx.active.turn.id, type: "series" });
     expect(response.status).toBe(403);
     ctx.db.run("UPDATE player_game_state SET has_guessed_correctly = 0 WHERE game_id = ? AND player_id = ?", [ctx.game.id, ctx.activeAuth.player.id]);
-    ctx.db.run("INSERT INTO purchased_hints VALUES (?, ?, ?, 'series', 'not-json', 2, ?)", ["bad", ctx.game.id, ctx.activeAuth.player.id, new Date().toISOString()]);
+    ctx.db.run("INSERT INTO purchased_hints (id, game_id, player_id, hint_type, hint_value, cost, purchased_at) VALUES (?, ?, ?, 'series', 'not-json', 2, ?)", ["bad", ctx.game.id, ctx.activeAuth.player.id, new Date().toISOString()]);
     expect(ctx.economyRepo.getHints(ctx.game.id, ctx.activeAuth.player.id)).toEqual([]);
   });
 });

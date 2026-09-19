@@ -8,6 +8,7 @@ export interface AIPlayerSelfContext {
   player: { id: string; name: string; pointBalance: number };
   game: { id: string; roomCode: string; turnId: string; turnNumber: number; phase: TurnPhase };
   evidence: Array<{ question: string; moderatorAnswer: AnswerValue }>;
+  publicHistory?: Array<{ turnNumber: number; activePlayerName: string; question: string; moderatorAnswer: AnswerValue; outcome: "guessed" | "passed" | "skipped" | null }>;
   previousGuesses: Array<{ characterName: string; correct: false }>;
   purchasedHints: PurchasedHint[];
   availableHintTypes: HintType[];
@@ -18,6 +19,7 @@ export interface AIPlayerAnswerContext {
   answeringPlayer: { id: string; name: string };
   game: { id: string; turnId: string; questionId: string };
   question: string;
+  publicHistory?: Array<{ turnNumber: number; activePlayerName: string; question: string; moderatorAnswer: AnswerValue }>;
   target: {
     playerId: string;
     playerName: string;

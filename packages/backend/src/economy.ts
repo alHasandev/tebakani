@@ -6,22 +6,21 @@ import { DomainError } from "./errors";
 export class EconomyRepository {
   constructor(private db: Database) {}
 
-  settleTurn(gameId: string, turnId: string, aiPolicy?: { playerId: string; collectionDelayMs: number; nowMs: number }): TurnPointAwardView[] {
-    const now = new Date().toISOString();
+  settleTurn(gameId: string, turnId: string, policy: { requesterPlayerId?: string; nowMs?: number } = {}): TurnPointAwardView[] {
+    const nowMs = policy.nowMs ?? Date.now();
+    const now = new Date(nowMs).toISOString();
     const tx = this.db.transaction(() => {
       const turn = this.db.prepare(`
-        SELECT gt.phase, gt.active_player_id, p.type active_player_type, q.id question_id, q.moderator_status, q.moderator_answer, q.asked_at
+         SELECT gt.phase, gt.active_player_id, p.type active_player_type, q.id question_id, q.moderator_status, q.moderator_answer, q.answer_deadline_at
         FROM game_turns gt JOIN players p ON p.id = gt.active_player_id JOIN questions q ON q.turn_id = gt.id
         WHERE gt.id = ? AND gt.game_id = ? AND gt.is_active = 1
-      `).get(turnId, gameId) as { phase: string; active_player_id: string; active_player_type: string; question_id: string; moderator_status: string; moderator_answer: string | null; asked_at: string } | null;
+      `).get(turnId, gameId) as { phase: string; active_player_id: string; active_player_type: string; question_id: string; moderator_status: string; moderator_answer: string | null; answer_deadline_at: string } | null;
       if (!turn || turn.phase !== "collecting_answers") throw new DomainError(409, "Turn is not ready for settlement");
+      if (policy.requesterPlayerId && turn.active_player_id !== policy.requesterPlayerId) throw new DomainError(403, "Only the active player can close answers");
       if (turn.moderator_status !== "answered" || !turn.moderator_answer) throw new DomainError(409, "Moderator answer must be ready before answers can be closed");
-      if (aiPolicy) {
-        if (turn.active_player_type !== "ai" || turn.active_player_id !== aiPolicy.playerId) throw new DomainError(403, "Only the active AI player can close answers");
-        const eligible = (this.db.prepare("SELECT COUNT(*) count FROM player_game_state WHERE game_id = ? AND player_id != ?").get(gameId, turn.active_player_id) as { count: number }).count;
-        const answered = (this.db.prepare("SELECT COUNT(*) count FROM turn_answers WHERE question_id = ?").get(turn.question_id) as { count: number }).count;
-        if (answered < eligible && aiPolicy.nowMs - Date.parse(turn.asked_at) < aiPolicy.collectionDelayMs) throw new DomainError(409, "Answer collection deadline has not elapsed");
-      }
+      const eligible = (this.db.prepare("SELECT COUNT(*) count FROM player_game_state WHERE game_id = ? AND player_id != ?").get(gameId, turn.active_player_id) as { count: number }).count;
+      const answered = (this.db.prepare("SELECT COUNT(*) count FROM turn_answers WHERE question_id = ?").get(turn.question_id) as { count: number }).count;
+      if (answered < eligible && nowMs < Date.parse(turn.answer_deadline_at)) throw new DomainError(409, "Answer collection deadline has not elapsed");
       const winners = this.db.prepare(`
         SELECT ta.answering_player_id player_id FROM turn_answers ta
         JOIN player_game_state pgs ON pgs.game_id = ? AND pgs.player_id = ta.answering_player_id
@@ -60,7 +59,7 @@ export class EconomyRepository {
       if (actorKind === "ai" && this.db.prepare("SELECT turn_id FROM ai_turn_hint_purchases WHERE turn_id = ?").get(expectedTurnId)) throw new DomainError(409, "AI may purchase at most one hint per turn");
       if (state.point_balance < cost) throw new DomainError(409, "Insufficient point balance");
       if (this.db.prepare("UPDATE player_game_state SET point_balance = point_balance - ? WHERE game_id = ? AND player_id = ? AND point_balance >= ?").run(cost, gameId, playerId, cost).changes < 1) throw new DomainError(409, "Insufficient point balance");
-      this.db.prepare("INSERT INTO purchased_hints (id, game_id, player_id, hint_type, hint_value, cost, purchased_at) VALUES (?, ?, ?, ?, ?, ?, ?)").run(id, gameId, playerId, hintType, JSON.stringify(value), cost, now);
+      this.db.prepare("INSERT INTO purchased_hints (id, game_id, player_id, hint_type, hint_value, cost, purchased_at, turn_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run(id, gameId, playerId, hintType, JSON.stringify(value), cost, now, expectedTurnId);
       this.db.prepare("INSERT INTO point_ledger (id, game_id, player_id, question_id, hint_purchase_id, amount, reason, created_at) VALUES (?, ?, ?, NULL, ?, ?, 'hint_purchase', ?)").run(randomUUID(), gameId, playerId, id, -cost, now);
       if (actorKind === "ai") this.db.prepare("INSERT INTO ai_turn_hint_purchases (turn_id, game_id, player_id, hint_purchase_id, created_at) VALUES (?, ?, ?, ?, ?)").run(expectedTurnId, gameId, playerId, id, now);
     });
@@ -164,13 +163,20 @@ export class HintService {
     const normalizedDescription = description.normalize("NFKC");
     const normalizedName = name.normalize("NFKC");
     const parts = normalizedName.split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+    const aliasParts = aliases.flatMap((alias) => alias.normalize("NFKC").split(/[^\p{L}\p{N}]+/u).filter(Boolean));
     let clue = normalizedDescription;
-    const forbidden = [normalizedName, ...aliases.map((alias) => alias.normalize("NFKC")), ...parts];
-    for (const token of forbidden.sort((left, right) => right.length - left.length)) clue = clue.replace(new RegExp(token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "giu"), "");
+    const forbidden = [normalizedName, ...aliases.map((alias) => alias.normalize("NFKC")), ...parts, ...aliasParts];
+    for (const token of forbidden.sort((left, right) => right.length - left.length)) {
+      const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      clue = clue.replace(new RegExp(`(?<![\\p{L}\\p{N}])${escaped}(?![\\p{L}\\p{N}])`, "giu"), "");
+    }
     clue = clue.replace(/\s+/g, " ").replace(/\s+([.,!?;:])/g, "$1").trim();
     const foldedClue = clue.normalize("NFKC").toLocaleLowerCase();
-    const meaningfulTokens = foldedClue.match(/[\p{L}\p{N}]+/gu)?.filter((token) => token.length > 2 && !["and", "the", "with", "from"].includes(token)) ?? [];
-    if (!clue || meaningfulTokens.length === 0 || parts.some((part) => foldedClue.includes(part.toLocaleLowerCase()))) return "";
+    const clueTokens: string[] = Array.from(foldedClue.matchAll(/[\p{L}\p{N}]+/gu), (match) => match[0]);
+    const stopWords: string[] = ["and", "the", "with", "from"];
+    const meaningfulTokens = clueTokens.filter((token) => token.length > 2 && !stopWords.includes(token));
+    const forbiddenTokens = [...parts, ...aliasParts].map((part) => part.toLocaleLowerCase());
+    if (!clue || meaningfulTokens.length === 0 || forbiddenTokens.some((part) => clueTokens.includes(part))) return "";
     return clue;
   }
 

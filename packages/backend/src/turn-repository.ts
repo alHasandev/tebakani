@@ -3,6 +3,7 @@ import { randomUUID } from "crypto";
 import type { TurnPhase, AnswerValue, PlayerType, ModeratorStatus, CharacterSummary } from "@tebakani/shared";
 import { DomainError } from "./errors";
 import type { GameActor } from "./ai-player-types";
+import { characterNameMatches } from "./character-identity";
 
 export interface TurnEntity {
   id: string;
@@ -15,6 +16,7 @@ export interface TurnEntity {
   isActive: boolean;
   startedAt: string;
   endedAt: string | null;
+  outcome: "guessed" | "passed" | "skipped" | null;
 }
 
 export interface QuestionEntity {
@@ -26,6 +28,9 @@ export interface QuestionEntity {
   moderatorStatus: ModeratorStatus;
   moderatorAnswer: AnswerValue | null;
   moderatorRevision: number;
+  answerDeadlineAt: string;
+  eligibleAnswererCount: number;
+  answeredCount: number;
 }
 
 export interface ModeratorJob {
@@ -49,10 +54,23 @@ export interface FullTurnDetails {
   question: QuestionEntity | null;
   answers: AnswerEntity[];
   awards: Array<{ playerId: string; amount: number }>;
+  guess: { characterName: string; correct: boolean; attemptedAt: string } | null;
+  hintPurchases: Array<{ id: string; playerId: string; playerName: string; playerType: PlayerType; hintType: "basic" | "series" | "candidates"; cost: number; purchasedAt: string }>;
 }
 
 export class TurnRepository {
-  constructor(private db: Database) {}
+  constructor(private db: Database, private now: () => number = Date.now) {}
+
+  private nowIso(): string { return new Date(this.now()).toISOString(); }
+
+  listHistory(gameId: string): FullTurnDetails[] {
+    const ids = (this.db.prepare("SELECT id FROM game_turns WHERE game_id = ? AND is_active = 0 AND ended_at IS NOT NULL ORDER BY turn_number ASC").all(gameId) as Array<{ id: string }>).map((row) => row.id);
+    return ids.map((id) => this.getTurnById(id)).filter((item): item is FullTurnDetails => item !== null);
+  }
+
+  private getTurnById(turnId: string): FullTurnDetails | null {
+    return this.readTurn("gt.id = ?", turnId);
+  }
 
   listActiveGames(): Array<{ gameId: string }> {
     return this.db.prepare("SELECT id gameId FROM games WHERE status = 'playing'").all() as Array<{ gameId: string }>;
@@ -68,9 +86,9 @@ export class TurnRepository {
     `).all(turnId, gameId) as Array<{ id: string }>).map((row) => row.id);
   }
 
-  getCollectionState(gameId: string, turnId: string): { activePlayerId: string; moderatorStatus: ModeratorStatus; moderatorAttempts: number; askedAt: string; eligibleCount: number; answeredCount: number } | null {
+  getCollectionState(gameId: string, turnId: string): { activePlayerId: string; moderatorStatus: ModeratorStatus; moderatorAttempts: number; askedAt: string; answerDeadlineAt: string; eligibleCount: number; answeredCount: number } | null {
     return this.db.prepare(`
-      SELECT gt.active_player_id activePlayerId, q.moderator_status moderatorStatus, q.moderator_attempts moderatorAttempts, q.asked_at askedAt,
+      SELECT gt.active_player_id activePlayerId, q.moderator_status moderatorStatus, q.moderator_attempts moderatorAttempts, q.asked_at askedAt, q.answer_deadline_at answerDeadlineAt,
              (SELECT COUNT(*) FROM player_game_state WHERE game_id = gt.game_id AND player_id != gt.active_player_id) eligibleCount,
              (SELECT COUNT(*) FROM turn_answers WHERE question_id = q.id) answeredCount
       FROM game_turns gt JOIN questions q ON q.turn_id = gt.id
@@ -79,12 +97,16 @@ export class TurnRepository {
   }
 
   getActiveTurn(gameId: string): FullTurnDetails | null {
+    return this.readTurn("gt.game_id = ? AND gt.is_active = 1", gameId);
+  }
+
+  private readTurn(where: string, value: string): FullTurnDetails | null {
     const turnRow = this.db.prepare(`
       SELECT gt.*, p.name as active_player_name, p.type as active_player_type
       FROM game_turns gt
       JOIN players p ON gt.active_player_id = p.id
-      WHERE gt.game_id = ? AND gt.is_active = 1
-    `).get(gameId) as {
+      WHERE ${where}
+    `).get(value) as {
       id: string;
       game_id: string;
       active_player_id: string;
@@ -95,6 +117,7 @@ export class TurnRepository {
       is_active: number;
       started_at: string;
       ended_at: string | null;
+      outcome: "guessed" | "passed" | "skipped" | null;
     } | null;
 
     if (!turnRow) return null;
@@ -109,7 +132,8 @@ export class TurnRepository {
       phase: turnRow.phase as TurnPhase,
       isActive: Boolean(turnRow.is_active),
       startedAt: turnRow.started_at,
-      endedAt: turnRow.ended_at
+      endedAt: turnRow.ended_at,
+      outcome: turnRow.outcome
     };
 
     const questionRow = this.db.prepare(`
@@ -123,10 +147,11 @@ export class TurnRepository {
       moderator_status: string;
       moderator_answer: string | null;
       moderator_revision: number;
+      answer_deadline_at: string;
     } | null;
 
     if (!questionRow) {
-      return { turn, question: null, answers: [], awards: [] };
+      return { turn, question: null, answers: [], awards: [], guess: this.getTurnGuess(turn.id), hintPurchases: this.getTurnHintPurchases(turn) };
     }
 
     const question: QuestionEntity = {
@@ -137,7 +162,10 @@ export class TurnRepository {
       askedAt: questionRow.asked_at,
       moderatorStatus: questionRow.moderator_status as ModeratorStatus,
       moderatorAnswer: questionRow.moderator_answer as AnswerValue | null,
-      moderatorRevision: questionRow.moderator_revision
+      moderatorRevision: questionRow.moderator_revision,
+      answerDeadlineAt: questionRow.answer_deadline_at,
+      eligibleAnswererCount: (this.db.prepare("SELECT COUNT(*) count FROM player_game_state WHERE game_id = ? AND player_id != ?").get(turn.gameId, turn.activePlayerId) as { count: number }).count,
+      answeredCount: 0
     };
 
     const answerRows = this.db.prepare(`
@@ -164,20 +192,37 @@ export class TurnRepository {
       answeredAt: a.answered_at
     }));
 
+    question.answeredCount = answers.length;
+
     const awards = this.db.prepare(`
       SELECT player_id playerId, amount FROM point_ledger
       WHERE question_id = ? AND reason = 'answer_match' ORDER BY player_id
     `).all(question.id) as Array<{ playerId: string; amount: number }>;
 
-    return { turn, question, answers, awards };
+    return { turn, question, answers, awards, guess: this.getTurnGuess(turn.id), hintPurchases: this.getTurnHintPurchases(turn) };
+  }
+
+  private getTurnHintPurchases(turn: TurnEntity): FullTurnDetails["hintPurchases"] {
+    return this.db.prepare(`
+      SELECT ph.id, ph.player_id playerId, p.name playerName, p.type playerType,
+             ph.hint_type hintType, ph.cost, ph.purchased_at purchasedAt
+      FROM purchased_hints ph JOIN players p ON p.id = ph.player_id
+      WHERE ph.turn_id = ?
+      ORDER BY ph.purchased_at, ph.id
+    `).all(turn.id) as FullTurnDetails["hintPurchases"];
+  }
+
+  private getTurnGuess(turnId: string): FullTurnDetails["guess"] {
+    const row = this.db.prepare("SELECT display_guess, correct, attempted_at FROM guess_attempts WHERE turn_id = ? ORDER BY attempted_at DESC LIMIT 1").get(turnId) as { display_guess: string; correct: number; attempted_at: string } | null;
+    return row ? { characterName: row.display_guess, correct: Boolean(row.correct), attemptedAt: row.attempted_at } : null;
   }
 
   askQuestionAtomic(gameId: string, requesterPlayerId: string, expectedTurnId: string, questionText: string, actor: GameActor = { kind: "human", playerId: requesterPlayerId }): void {
-    const now = new Date().toISOString();
+    const now = this.nowIso();
     const questionId = randomUUID();
 
     const tx = this.db.transaction(() => {
-      const gameRow = this.db.prepare("SELECT status FROM games WHERE id = ?").get(gameId) as { status: string } | null;
+      const gameRow = this.db.prepare("SELECT status, answer_duration_seconds FROM games WHERE id = ?").get(gameId) as { status: string; answer_duration_seconds: number } | null;
       if (!gameRow || gameRow.status !== "playing") {
         throw new DomainError(409, "Game is not in playing status");
       }
@@ -220,6 +265,15 @@ export class TurnRepository {
         throw new DomainError(403, "Completed player cannot ask questions");
       }
 
+      const normalized = questionText.normalize("NFKC").toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, " ").trim();
+      const prior = this.db.prepare(`
+        SELECT q.question_text FROM questions q JOIN game_turns prior_turn ON prior_turn.id = q.turn_id
+        WHERE prior_turn.game_id = ? AND prior_turn.active_player_id = ?
+      `).all(gameId, requesterPlayerId) as Array<{ question_text: string }>;
+      if (prior.some((item) => item.question_text.normalize("NFKC").toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, " ").trim() === normalized)) {
+        throw new DomainError(409, "Question has already been asked by this player");
+      }
+
       const updateResult = this.db.prepare(`
         UPDATE game_turns SET phase = 'collecting_answers' WHERE id = ? AND phase = 'waiting_for_question'
       `).run(turn.id);
@@ -229,9 +283,9 @@ export class TurnRepository {
       }
 
       this.db.prepare(`
-        INSERT INTO questions (id, turn_id, asking_player_id, question_text, asked_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(questionId, turn.id, requesterPlayerId, questionText, now);
+        INSERT INTO questions (id, turn_id, asking_player_id, question_text, asked_at, answer_deadline_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(questionId, turn.id, requesterPlayerId, questionText, now, new Date(this.now() + gameRow.answer_duration_seconds * 1000).toISOString());
     });
 
     tx();
@@ -350,7 +404,8 @@ export class TurnRepository {
   }
 
   submitAnswerAtomic(gameId: string, requesterPlayerId: string, expectedTurnId: string, answer: AnswerValue, actor: GameActor = { kind: "human", playerId: requesterPlayerId }): void {
-    const now = new Date().toISOString();
+    const nowMs = this.now();
+    const now = new Date(nowMs).toISOString();
     const answerId = randomUUID();
 
     const tx = this.db.transaction(() => {
@@ -375,11 +430,11 @@ export class TurnRepository {
       }
 
       const turn = this.db.prepare(`
-        SELECT gt.id, gt.active_player_id, gt.phase, q.id as question_id
+        SELECT gt.id, gt.active_player_id, gt.phase, q.id as question_id, q.answer_deadline_at
         FROM game_turns gt
         LEFT JOIN questions q ON gt.id = q.turn_id
         WHERE gt.game_id = ? AND gt.is_active = 1
-      `).get(gameId) as { id: string; active_player_id: string; phase: string; question_id: string | null } | null;
+      `).get(gameId) as { id: string; active_player_id: string; phase: string; question_id: string | null; answer_deadline_at: string | null } | null;
 
       if (!turn || !turn.question_id) {
         throw new DomainError(409, "No active question found to answer");
@@ -395,6 +450,10 @@ export class TurnRepository {
 
       if (turn.phase !== "collecting_answers") {
         throw new DomainError(409, "Turn is not in collecting_answers phase");
+      }
+
+      if (!turn.answer_deadline_at || nowMs >= Date.parse(turn.answer_deadline_at)) {
+        throw new DomainError(409, "Answer collection deadline has elapsed");
       }
 
       this.db.prepare(`
@@ -519,11 +578,10 @@ export class TurnRepository {
       }
 
       const normalizedGuess = characterName.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
-      const normalizedActual = pgs.character_name.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
       let aliases: string[] = [];
       try { aliases = pgs.character_snapshot_json ? JSON.parse(pgs.character_snapshot_json)?.knowledge?.aliases ?? [] : []; } catch {}
-      const verifiedNames = [normalizedActual, ...aliases.map((alias) => alias.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " "))];
-      const isCorrect = verifiedNames.includes(normalizedGuess);
+      const verifiedNames = [pgs.character_name, ...aliases.filter((alias): alias is string => typeof alias === "string")];
+      const isCorrect = verifiedNames.some((name) => characterNameMatches(characterName, name));
 
       try {
         this.db.prepare(`
@@ -536,7 +594,7 @@ export class TurnRepository {
       }
 
       const closeTurnResult = this.db.prepare(`
-        UPDATE game_turns SET is_active = 0, ended_at = ? WHERE id = ? AND is_active = 1
+        UPDATE game_turns SET is_active = 0, ended_at = ?, outcome = 'guessed' WHERE id = ? AND is_active = 1
       `).run(now, turn.id);
 
       if (closeTurnResult.changes === 0) {
@@ -586,8 +644,8 @@ export class TurnRepository {
     return resultOutcome;
   }
 
-  passTurnAtomic(gameId: string, requesterPlayerId: string, expectedTurnId: string): void {
-    const now = new Date().toISOString();
+  passTurnAtomic(gameId: string, requesterPlayerId: string, expectedTurnId: string, outcome: "passed" | "skipped" = "passed"): void {
+    const now = this.nowIso();
 
     const tx = this.db.transaction(() => {
       const gameRow = this.db.prepare("SELECT status FROM games WHERE id = ?").get(gameId) as { status: string } | null;
@@ -625,8 +683,8 @@ export class TurnRepository {
       }
 
       const closeTurnResult = this.db.prepare(`
-        UPDATE game_turns SET is_active = 0, ended_at = ? WHERE id = ? AND is_active = 1
-      `).run(now, turn.id);
+        UPDATE game_turns SET is_active = 0, ended_at = ?, outcome = ? WHERE id = ? AND is_active = 1
+      `).run(now, outcome, turn.id);
 
       if (closeTurnResult.changes === 0) {
         throw new DomainError(409, "Turn was completed or passed concurrently");
@@ -655,7 +713,7 @@ export class TurnRepository {
   }
 
   skipAiTurnAtomic(gameId: string, requesterPlayerId: string, expectedTurnId: string): void {
-    const now = new Date().toISOString();
+    const now = this.nowIso();
 
     const tx = this.db.transaction(() => {
       const gameRow = this.db.prepare("SELECT status FROM games WHERE id = ?").get(gameId) as { status: string } | null;
@@ -699,7 +757,7 @@ export class TurnRepository {
       }
 
       const closeTurnResult = this.db.prepare(`
-        UPDATE game_turns SET is_active = 0, ended_at = ? WHERE id = ? AND is_active = 1
+        UPDATE game_turns SET is_active = 0, ended_at = ?, outcome = 'skipped' WHERE id = ? AND is_active = 1
       `).run(now, turn.id);
 
       if (closeTurnResult.changes === 0) {

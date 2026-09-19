@@ -39,8 +39,8 @@ describe("Milestone 6 AI trust and durable policy", () => {
   it("builds self context by allowlist and exposes only legitimately purchased hint values", async () => {
     const ctx = await setup();
     ctx.db.run("UPDATE player_game_state SET point_balance = 20 WHERE game_id = ? AND player_id = ?", [ctx.game.id, ctx.ai.id]);
-    ctx.db.run("INSERT INTO purchased_hints VALUES ('series-hint', ?, ?, 'series', ?, 2, '2026-01-01T00:00:00Z')", [ctx.game.id, ctx.ai.id, JSON.stringify(ctx.aiState.character.series)]);
-    ctx.db.run("INSERT INTO purchased_hints VALUES ('candidate-hint', ?, ?, 'candidates', ?, 7, '2026-01-01T00:00:01Z')", [ctx.game.id, ctx.ai.id, JSON.stringify([ctx.aiState.character.name, "Decoy"])]);
+    ctx.db.run("INSERT INTO purchased_hints (id, game_id, player_id, hint_type, hint_value, cost, purchased_at) VALUES ('series-hint', ?, ?, 'series', ?, 2, '2026-01-01T00:00:00Z')", [ctx.game.id, ctx.ai.id, JSON.stringify(ctx.aiState.character.series)]);
+    ctx.db.run("INSERT INTO purchased_hints (id, game_id, player_id, hint_type, hint_value, cost, purchased_at) VALUES ('candidate-hint', ?, ?, 'candidates', ?, 7, '2026-01-01T00:00:01Z')", [ctx.game.id, ctx.ai.id, JSON.stringify([ctx.aiState.character.name, "Decoy"])]);
     const context = ctx.contexts.buildSelf(ctx.game.id, ctx.ai.id, ctx.turn.turn.id);
     const serialized = JSON.stringify(context);
     expect(Object.keys(context.player).sort()).toEqual(["id", "name", "pointBalance"]);

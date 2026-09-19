@@ -6,7 +6,9 @@ import type { AIPlayerAnswerContext, AIPlayerSelfContext } from "./ai-player-typ
 function safeCharacterSnapshot(value: string | null, fallback: { id: string; name: string; series: string; imageUrl?: string; description?: string }) {
   try {
     const parsed = value ? JSON.parse(value) : fallback;
-    return { id: parsed.id, name: parsed.name, series: parsed.series, imageUrl: parsed.imageUrl, description: parsed.description, knowledge: parsed.knowledge };
+    if (typeof parsed.id !== "string" || !parsed.id || typeof parsed.name !== "string" || !parsed.name || typeof parsed.series !== "string" || !parsed.series) return fallback;
+    const { sourceUrl: _, ...rest } = parsed;
+    return { id: rest.id, name: rest.name, series: rest.series, imageUrl: rest.imageUrl, description: rest.description, knowledge: rest.knowledge };
   } catch { return fallback; }
 }
 
@@ -40,9 +42,17 @@ export class AIPlayerContextRepository {
     const evidence = this.db.prepare(`
       SELECT q.question_text question, q.moderator_answer moderatorAnswer
       FROM questions q JOIN game_turns gt ON gt.id = q.turn_id
-      WHERE gt.game_id = ? AND gt.active_player_id = ? AND q.moderator_status = 'answered'
-      ORDER BY gt.turn_number DESC LIMIT 30
+       WHERE gt.game_id = ? AND gt.active_player_id = ? AND q.moderator_status = 'answered'
+         AND (gt.is_active = 0 OR gt.phase = 'awaiting_guess')
+       ORDER BY gt.turn_number DESC LIMIT 30
     `).all(gameId, playerId) as Array<{ question: string; moderatorAnswer: AnswerValue }>;
+    const publicHistory = this.db.prepare(`
+      SELECT gt.turn_number turnNumber, p.name activePlayerName, q.question_text question,
+             q.moderator_answer moderatorAnswer, gt.outcome
+      FROM game_turns gt JOIN players p ON p.id = gt.active_player_id JOIN questions q ON q.turn_id = gt.id
+       WHERE gt.game_id = ? AND q.moderator_status = 'answered' AND gt.is_active = 0 AND gt.ended_at IS NOT NULL
+       ORDER BY gt.turn_number DESC LIMIT 30
+    `).all(gameId) as NonNullable<AIPlayerSelfContext["publicHistory"]>;
     const previousGuesses = this.db.prepare(`
       SELECT display_guess characterName, 0 correct FROM guess_attempts
       WHERE game_id = ? AND player_id = ? AND correct = 0 ORDER BY attempted_at DESC LIMIT 30
@@ -52,7 +62,7 @@ export class AIPlayerContextRepository {
     return {
       player: { id: row.player_id, name: row.player_name, pointBalance: row.point_balance },
       game: { id: row.game_id, roomCode: row.room_code, turnId: row.turn_id, turnNumber: row.turn_number, phase: row.phase as TurnPhase },
-      evidence: evidence.reverse(), previousGuesses, purchasedHints: hints,
+      evidence: evidence.reverse(), publicHistory: publicHistory.reverse(), previousGuesses, purchasedHints: hints,
       availableHintTypes: (["basic", "series", "candidates"] as HintType[]).filter((type) => !purchased.has(type) && ECONOMY.hintCosts[type] <= row.point_balance),
       economy: ECONOMY.hintCosts
     };
@@ -72,11 +82,30 @@ export class AIPlayerContextRepository {
     `).get(answeringPlayerId, gameId, expectedTurnId) as any;
     if (!row || row.answering_type !== "ai") throw new DomainError(403, "Trusted AI actor is not an AI player in this game");
     if (row.answering_id === row.target_id) throw new DomainError(403, "AI player cannot answer its own question");
+    const publicHistory = this.db.prepare(`
+      SELECT gt.turn_number turnNumber, p.name activePlayerName, q.question_text question, q.moderator_answer moderatorAnswer
+      FROM game_turns gt JOIN players p ON p.id = gt.active_player_id JOIN questions q ON q.turn_id = gt.id
+       WHERE gt.game_id = ? AND q.moderator_status = 'answered' AND gt.id != ?
+         AND gt.is_active = 0 AND gt.ended_at IS NOT NULL
+       ORDER BY gt.turn_number DESC LIMIT 20
+    `).all(gameId, expectedTurnId) as NonNullable<AIPlayerAnswerContext["publicHistory"]>;
     return {
       answeringPlayer: { id: row.answering_id, name: row.answering_name },
       game: { id: gameId, turnId: row.turn_id, questionId: row.question_id }, question: row.question_text,
+      publicHistory: publicHistory.reverse(),
       target: { playerId: row.target_id, playerName: row.target_name, character: safeCharacterSnapshot(row.character_snapshot_json, { id: row.assigned_character_id, name: row.character_name, series: row.character_series, imageUrl: row.character_image_url ?? undefined, description: row.character_description ?? undefined }) }
     };
+  }
+
+  getUsedQuestionIdentities(gameId: string, playerId: string): string[] {
+    const rows = this.db.prepare(`
+      SELECT q.question_text
+      FROM questions q JOIN game_turns gt ON gt.id = q.turn_id
+      WHERE gt.game_id = ? AND gt.active_player_id = ?
+      ORDER BY gt.turn_number ASC
+      LIMIT 10000
+    `).all(gameId, playerId) as Array<{ question_text: string }>;
+    return rows.map((row) => row.question_text.normalize("NFKC").toLocaleLowerCase().replace(/[\p{P}\p{S}\s]+/gu, " ").trim());
   }
 
   getWrongGuesses(gameId: string, playerId: string): string[] {

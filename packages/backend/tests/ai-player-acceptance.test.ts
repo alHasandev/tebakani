@@ -93,6 +93,34 @@ describe("Milestone 6 production agent structured output", () => {
     expect(calls).toBe(2);
   });
 
+  it("requires a character guess once accumulated evidence is sufficient", async () => {
+    const evidence = [
+      ["Was the series first published in 2003?", "yes"],
+      ["Is the character initially a high school student?", "yes"],
+      ["Does the character possess a supernatural notebook?", "yes"],
+      ["Is the character accompanied by a Shinigami?", "yes"],
+      ["Is the character known as Kira?", "yes"],
+      ["Is the primary adversary known by one letter?", "yes"]
+    ].map(([question, moderatorAnswer]) => ({ question, moderatorAnswer: moderatorAnswer as "yes" }));
+    let receivedSchema: { safeParse(value: unknown): { success: boolean } } | undefined;
+    const agent = new VercelAIPlayerAgent(env, ZERO_DELAY_CONFIG, globalThis.fetch, async ({ schema }) => {
+      receivedSchema = schema;
+      return { action: "guess", characterName: "Light Yagami" };
+    });
+    await expect(agent.decideGuessOrPass({ ...selfContext, evidence })).resolves.toEqual({ action: "guess", characterName: "Light Yagami" });
+    expect(receivedSchema?.safeParse({ action: "pass" }).success).toBe(false);
+  });
+
+  it("spends available points on the most valuable unpurchased hint", async () => {
+    let calls = 0;
+    const agent = new VercelAIPlayerAgent(env, ZERO_DELAY_CONFIG, globalThis.fetch, async () => { calls++; return { action: "none" }; });
+    await expect(agent.decideHint({ ...selfContext, player: { ...selfContext.player, pointBalance: 3 }, availableHintTypes: ["basic", "series", "candidates"] })).resolves.toEqual({ action: "purchase", type: "candidates" });
+    await expect(agent.decideHint({ ...selfContext, player: { ...selfContext.player, pointBalance: 2 }, availableHintTypes: ["basic", "series"] })).resolves.toEqual({ action: "purchase", type: "series" });
+    await expect(agent.decideHint({ ...selfContext, player: { ...selfContext.player, pointBalance: 1 }, availableHintTypes: ["basic"] })).resolves.toEqual({ action: "purchase", type: "basic" });
+    await expect(agent.decideHint(selfContext)).resolves.toEqual({ action: "none" });
+    expect(calls).toBe(0);
+  });
+
   it("forwards cancellation through the lazy wrapper and never starts regeneration after abort", async () => {
     const controller = new AbortController();
     let calls = 0;
@@ -128,12 +156,11 @@ describe("Milestone 6 production agent structured output", () => {
   });
 
   it("bounds malformed regeneration and rejects every operation instead of casting arbitrary output", async () => {
-    for (const operation of ["answer", "hint", "question", "guess"] as const) {
+    for (const operation of ["answer", "question", "guess"] as const) {
       let calls = 0;
       const agent = new VercelAIPlayerAgent(env, ZERO_DELAY_CONFIG, globalThis.fetch, async () => { calls++; return { arbitrary: true }; });
       const promise = operation === "answer"
         ? agent.answerQuestion({ answeringPlayer: { id: "ai", name: "AI" }, game: { id: "game", turnId: "turn", questionId: "question" }, question: "Q?", target: { playerId: "human", playerName: "Human", character: COMPLETE_CHARACTERS[0] } })
-        : operation === "hint" ? agent.decideHint(selfContext)
         : operation === "question" ? agent.generateQuestion(selfContext)
         : agent.decideGuessOrPass(selfContext);
       await expect(promise).rejects.toThrow("Invalid gameplay decision");
@@ -189,8 +216,12 @@ describe("Milestone 6 deterministic AI trust", () => {
     const own = stateFor(value, value.host.player.id).character;
     const view = value.gameService.getGameViewForPlayer(value.host.room.code, value.host.player.id)!;
     const raw = JSON.stringify(view);
-    for (const secret of [own.id, own.name, own.description, own.imageUrl]) expect(raw).not.toContain(secret!);
-    expect(view.players.find((player) => player.playerId === value.host.player.id)?.character).toBeUndefined();
+    const hostView = view.players.find((player) => player.playerId === value.host.player.id)!;
+    expect(hostView.character).toBeUndefined();
+    const allVisibleCharacterIds = view.players.filter((p) => p.character).map((p) => p.character!.id);
+    expect(allVisibleCharacterIds).not.toContain(own.id);
+    const allVisibleCharacterNames = view.players.filter((p) => p.character).map((p) => p.character!.name);
+    expect(allVisibleCharacterNames).not.toContain(own.name);
     for (const forbidden of ["systemPrompt", "prompt", "rawOutput", "assigned_character", "previousGuesses", "availableHintTypes"]) expect(raw).not.toContain(forbidden);
     expect(view.players.find((player) => player.playerId === ai.id)?.character).toBeDefined();
   });
@@ -229,7 +260,7 @@ describe("Milestone 6 deterministic answers and scoring", () => {
     gate.resolve("yes");
     await drainAI(value);
     expect(value.db.prepare("SELECT COUNT(*) count FROM turn_answers WHERE question_id = ? AND answering_player_id = ?").get(questionId, ai.id)).toEqual({ count: 1 });
-    await expect(value.gameService.submitAnswerAsAI(value.host.room.code, { kind: "ai", playerId: ai.id }, turn.turn.id, "no")).resolves.toBeDefined();
+    await expect(value.gameService.submitAnswerAsAI(value.host.room.code, { kind: "ai", playerId: ai.id }, turn.turn.id, "no")).rejects.toThrow();
     makeActive(value, ai.id, "collecting_answers");
     await expect(value.gameService.submitAnswerAsAI(value.host.room.code, { kind: "ai", playerId: ai.id }, turn.turn.id, "yes")).rejects.toThrow("own question");
     value.db.run("UPDATE game_turns SET phase = 'awaiting_guess' WHERE id = ?", [turn.turn.id]);
@@ -299,6 +330,11 @@ describe("Milestone 6 deterministic autonomous turns, hints, and failures", () =
     const turnValue = await fixture({ agent: turnAgent });
     const ai = turnValue.ais[0];
     const turn = makeActive(turnValue, ai.id);
+    turnValue.aiRunner.reconcile(turnValue.game.id);
+    for (let index = 0; index < 20 && !turnValue.turnRepo.getActiveTurn(turnValue.game.id)!.question; index++) await new Promise<void>((resolve) => queueMicrotask(resolve));
+    await turnValue.awaitEvaluations();
+    turnValue.db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turn.turn.id]);
+    await turnValue.gameService.reconcileAnswerClosure(turnValue.host.room.code, turn.turn.id, Date.now());
     turnValue.aiRunner.reconcile(turnValue.game.id);
     await drainAI(turnValue);
     expect(turnValue.db.prepare("SELECT COUNT(*) count FROM purchased_hints").get()).toEqual({ count: 0 });
@@ -399,8 +435,6 @@ describe("Milestone 6 moderator closure policy", () => {
   });
 
   it("never closes while moderation is pending and closes after answered deadline only", async () => {
-    let now = Date.now();
-    const runtime = { sleep: async () => {}, random: () => 0, now: () => now };
     const value = await fixture({ config: { ...ZERO_DELAY_CONFIG, collectionDelayMs: 1000 } });
     const active = value.ais[0];
     const turn = makeActive(value, active.id);
@@ -410,9 +444,31 @@ describe("Milestone 6 moderator closure policy", () => {
     expect(value.turnRepo.getActiveTurn(value.game.id)!.turn.phase).toBe("collecting_answers");
     const questionId = value.gameService.getQuestionId(value.host.room.code, turn.turn.id);
     await value.gameService.evaluateQuestion(questionId);
-    const askedAt = Date.parse(value.turnRepo.getActiveTurn(value.game.id)!.question!.askedAt);
-    await expect(value.gameService.closeAnswersAsAI(value.host.room.code, { kind: "ai", playerId: active.id }, turn.turn.id, 1000, askedAt + 999)).rejects.toThrow("deadline");
-    await expect(value.gameService.closeAnswersAsAI(value.host.room.code, { kind: "ai", playerId: active.id }, turn.turn.id, 1000, askedAt + 1000)).resolves.toBeDefined();
+    const deadline = Date.parse(value.turnRepo.getActiveTurn(value.game.id)!.question!.answerDeadlineAt);
+    await expect(value.gameService.closeAnswersAsAI(value.host.room.code, { kind: "ai", playerId: active.id }, turn.turn.id, 1000, deadline - 1)).rejects.toThrow("deadline");
+    await expect(value.gameService.closeAnswersAsAI(value.host.room.code, { kind: "ai", playerId: active.id }, turn.turn.id, 1000, deadline)).resolves.toBeDefined();
+  });
+
+  it("waits for an active deferred moderator retry before shutdown can safely close the database", async () => {
+    const retry = deferred<AnswerValue>();
+    const value = await fixture({ moderator: new ScriptedModerator(new Error("first"), retry.promise), config: { ...ZERO_DELAY_CONFIG, moderatorRetries: 1 } });
+    const ai = value.ais[0];
+    const turn = makeActive(value, ai.id);
+    await value.gameService.askQuestionAsAI(value.host.room.code, { kind: "ai", playerId: ai.id }, turn.turn.id, "Q?");
+    const questionId = value.gameService.getQuestionId(value.host.room.code, turn.turn.id);
+    await value.gameService.evaluateQuestion(questionId, 2);
+    value.aiRunner.reconcile(value.game.id);
+    while ((value.moderator as ScriptedModerator).requests.length < 2) await Promise.resolve();
+    let stopped = false;
+    const stopping = value.aiRunner.stop().then(() => { stopped = true; });
+    await Promise.resolve();
+    expect(stopped).toBe(false);
+    retry.resolve("yes");
+    await stopping;
+    expect(value.db.prepare("SELECT moderator_status status FROM questions WHERE id = ?").get(questionId)).toEqual({ status: "answered" });
+    value.db.close();
+    openContexts.splice(openContexts.indexOf(value.context), 1);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
   });
 
   it("persists a bounded failed retry ceiling and successful retry resumes closure", async () => {
@@ -435,6 +491,9 @@ describe("Milestone 6 moderator closure policy", () => {
     await success.gameService.askQuestionAsAI(success.host.room.code, { kind: "ai", playerId: successAI.id }, successTurn.turn.id, "Q?");
     const successQuestion = success.gameService.getQuestionId(success.host.room.code, successTurn.turn.id);
     await success.gameService.evaluateQuestion(successQuestion, 2);
+    await success.gameService.retryModerator(success.host.room.code, successAI.id, successTurn.turn.id);
+    success.db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE id = ?", [successQuestion]);
+    await success.gameService.reconcileAnswerClosure(success.host.room.code, successTurn.turn.id, Date.now());
     success.aiRunner.reconcile(success.game.id);
     await drainAI(success);
     expect(success.db.prepare("SELECT moderator_status status, moderator_attempts attempts FROM questions WHERE id = ?").get(successQuestion)).toEqual({ status: "answered", attempts: 2 });
@@ -500,7 +559,10 @@ describe("Milestone 6 restart/reconcile and multi-AI", () => {
       const turn = makeActive(first, active);
       if (phase !== "waiting_for_question") {
         await askAndModerate(first, active);
-        if (phase === "awaiting_guess") await first.gameService.closeAnswersAsAI(first.host.room.code, { kind: "ai", playerId: ai.id }, turn.turn.id, 0, Date.now());
+        if (phase === "awaiting_guess") {
+          first.db.run("UPDATE questions SET answer_deadline_at = '2000-01-01T00:00:00.000Z' WHERE turn_id = ?", [turn.turn.id]);
+          await first.gameService.closeAnswersAsAI(first.host.room.code, { kind: "ai", playerId: ai.id }, turn.turn.id, 0, Date.now());
+        }
       }
       await shutdown(first.context);
       openContexts.splice(openContexts.indexOf(first.context), 1);
@@ -572,7 +634,7 @@ describe("Milestone 6 restart/reconcile and multi-AI", () => {
       expect(values).not.toContain(own.id);
       expect(values).not.toContain(own.name);
     }
-    await value.gameService.closeAnswers(value.host.room.code, value.host.player.id, turnId);
+    expect(value.turnRepo.getActiveTurn(value.game.id)!.turn.phase).toBe("awaiting_guess");
     expect(value.db.prepare("SELECT COUNT(*) count FROM point_ledger WHERE question_id = ? AND amount = ? AND reason = 'answer_match'").get(questionId, ECONOMY.correctAnswerPoints)).toEqual({ count: 3 });
     await value.gameService.passTurn(value.host.room.code, value.host.player.id, turnId);
     const orders = value.db.prepare("SELECT player_id id, turn_order turnOrder FROM player_game_state WHERE game_id = ? ORDER BY turn_order").all(value.game.id) as Array<{ id: string; turnOrder: number }>;

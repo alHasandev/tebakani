@@ -9,6 +9,7 @@ export interface GameEntity {
   roomCode: string;
   status: GameStatus;
   revision: number;
+  answerDurationSeconds: number;
   currentTurnPlayerId: string | null;
   createdAt: string;
   startedAt: string | null;
@@ -39,7 +40,7 @@ export class GameRepository {
 
   getGameByRoomId(roomId: string): GameEntity | null {
     const row = this.db.prepare(`
-      SELECT g.id, g.room_id, g.status, g.state_revision, g.current_turn_player_id, g.created_at, g.started_at, g.finished_at, r.code as room_code
+      SELECT g.id, g.room_id, g.status, g.state_revision, g.answer_duration_seconds, g.current_turn_player_id, g.created_at, g.started_at, g.finished_at, r.code as room_code
       FROM games g
       JOIN rooms r ON g.room_id = r.id
       WHERE g.room_id = ?
@@ -48,6 +49,7 @@ export class GameRepository {
       room_id: string;
       status: string;
       state_revision: number;
+      answer_duration_seconds: number;
       current_turn_player_id: string | null;
       created_at: string;
       started_at: string | null;
@@ -63,6 +65,7 @@ export class GameRepository {
       roomCode: row.room_code,
       status: row.status as GameStatus,
       revision: row.state_revision,
+      answerDurationSeconds: row.answer_duration_seconds,
       currentTurnPlayerId: row.current_turn_player_id,
       createdAt: row.created_at,
       startedAt: row.started_at,
@@ -124,8 +127,17 @@ export class GameRepository {
       completedAt: r.completed_at,
       pointBalance: r.point_balance,
       character: (() => {
-        try { return r.character_snapshot_json ? JSON.parse(r.character_snapshot_json) as CharacterSummary : { id: r.assigned_character_id, name: r.character_name, series: r.character_series, imageUrl: r.character_image_url ?? undefined, description: r.character_description ?? undefined }; }
-        catch { return { id: r.assigned_character_id, name: r.character_name, series: r.character_series, imageUrl: r.character_image_url ?? undefined, description: r.character_description ?? undefined }; }
+        const legacy = { id: r.assigned_character_id, name: r.character_name, series: r.character_series, imageUrl: r.character_image_url ?? undefined, description: r.character_description ?? undefined };
+        try {
+          const snapshot: unknown = r.character_snapshot_json ? JSON.parse(r.character_snapshot_json) : null;
+          if (!snapshot || typeof snapshot !== "object") return legacy;
+          const value = snapshot as Record<string, unknown>;
+          if (typeof value.id !== "string" || !value.id.trim() || typeof value.name !== "string" || !value.name.trim() || typeof value.series !== "string" || !value.series.trim()) return legacy;
+          if (value.description !== undefined && typeof value.description !== "string") return legacy;
+          if (value.imageUrl !== undefined && typeof value.imageUrl !== "string") return legacy;
+          if (value.knowledge !== undefined && (!value.knowledge || typeof value.knowledge !== "object" || Array.isArray(value.knowledge))) return legacy;
+          return snapshot as CharacterSummary;
+        } catch { return legacy; }
       })()
     }));
   }
@@ -141,9 +153,9 @@ export class GameRepository {
 
     const tx = this.db.transaction(() => {
       this.db.prepare(`
-        INSERT INTO games (id, room_id, status, current_turn_player_id, created_at, started_at, finished_at)
-        VALUES (?, ?, 'playing', ?, ?, ?, NULL)
-      `).run(gameId, roomId, firstTurnPlayerId, now, now);
+        INSERT INTO games (id, room_id, status, answer_duration_seconds, current_turn_player_id, created_at, started_at, finished_at)
+        SELECT ?, ?, 'playing', answer_duration_seconds, ?, ?, ?, NULL FROM rooms WHERE id = ?
+      `).run(gameId, roomId, firstTurnPlayerId, now, now, roomId);
 
       const pgsStmt = this.db.prepare(`
         INSERT INTO player_game_state (
